@@ -41,7 +41,7 @@ cd pi-dictate
 ./scripts/install-whisper.sh
 ```
 
-The script builds `whisper-cli` when it is missing, downloads the checksum-verified q5_0 model, and installs:
+The script installs the pinned whisper.cpp v1.9.3 CLI when it is missing or outdated, downloads the checksum-verified q5_0 model, and installs:
 
 ```text
 ~/.local/bin/whisper-cli
@@ -114,7 +114,7 @@ Plaintext HTTP is accepted only for loopback endpoints. Backend selection is exp
 
 - **`arecord` not found:** install `alsa-utils`.
 - **No microphone level:** run the capture command above and set `PI_DICTATE_AUDIO_DEVICE` if ALSA's default is not the intended input.
-- **`whisper-cli` or model not found:** run `scripts/install-whisper.sh` and check `PATH` plus `PI_DICTATE_MODEL_PATH`.
+- **`whisper-cli` or model not found:** run `scripts/install-whisper.sh` and check `PATH` plus `PI_DICTATE_MODEL_PATH`. Use `FORCE_REINSTALL=1 ./scripts/install-whisper.sh` to rebuild the CLI.
 - **Shortcuts in tmux:** the default `alt` bindings use terminal sequences that tmux forwards without extended-key configuration.
 - **Text went to the main editor:** focus a text field before transcription finishes.
 
