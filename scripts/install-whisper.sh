@@ -29,7 +29,7 @@ if [ "${FORCE_REINSTALL:-0}" = "1" ] || ! binary_is_current; then
     echo "Unexpected whisper.cpp commit" >&2
     exit 1
   }
-  cmake -S "$WORK/whisper.cpp" -B "$WORK/build" -DBUILD_SHARED_LIBS=OFF -DWHISPER_BUILD_TESTS=OFF
+  cmake -S "$WORK/whisper.cpp" -B "$WORK/build" -DBUILD_SHARED_LIBS=OFF -DWHISPER_BUILD_IS_DEV=OFF -DWHISPER_BUILD_TESTS=OFF
   cmake --build "$WORK/build" --config Release -j "$(nproc)" --target whisper-cli
   install -m 0755 "$WORK/build/bin/whisper-cli" "$BIN_DIR/whisper-cli"
 fi
