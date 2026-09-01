@@ -526,3 +526,23 @@ test("whitespace-only final transcripts are ignored", async () => {
 
   assert.equal(await finishing, "Real content.");
 });
+
+test("sendAudio wraps a socket send failure into a sanitized terminal error, closes the socket, and short-circuits later sends", async () => {
+  // The fixture's socket never opens, so send() throws (CONNECTING), like a
+  // real WebSocket would on an unauthenticated/unready connection.
+  const { session, socket } = sessionFixture();
+
+  assert.throws(() => session.sendAudio(Buffer.from([1, 2])), (error: Error) => {
+    assert.doesNotMatch(error.message, /dg_super_secret_key/);
+    return true;
+  });
+  assert.equal(socket().closed, true);
+
+  const sentBefore = socket().sent.length;
+  assert.throws(() => session.sendAudio(Buffer.from([3, 4])), (error: Error) => {
+    assert.doesNotMatch(error.message, /dg_super_secret_key/);
+    return true;
+  });
+  // The second call reused the stored terminal outcome instead of touching the socket again.
+  assert.equal(socket().sent.length, sentBefore);
+});

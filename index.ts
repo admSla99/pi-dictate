@@ -279,7 +279,21 @@ export function createDeepgramSession(config: DictateConfig, options: DeepgramSe
   });
 
   const sendAudio = (chunk: Buffer): void => {
-    socket.send(chunk);
+    // Once a terminal outcome is known, throw it directly instead of touching
+    // an already-closed socket again; native WebSocket.send() would otherwise
+    // silently drop bytes while CLOSING/CLOSED, hiding the failure forever.
+    if (terminalResult) {
+      throw terminalResult.ok ? deepgramError("closed; cannot send more audio") : terminalResult.error;
+    }
+    try {
+      socket.send(chunk);
+    } catch {
+      const error = deepgramError("failed to send audio");
+      recordTerminal({ ok: false, error });
+      cleanup();
+      closeBestEffort();
+      throw error;
+    }
   };
 
   const finish = (): Promise<string> => {
@@ -790,11 +804,13 @@ export default function (pi: ExtensionAPI, dependencies: Partial<DictateDependen
     } catch {}
     abort?.abort();
     // Idempotent: harmless whether the session is still connecting, mid-finalize,
-    // or already settled from a successful finish().
-    pendingSession?.abort().catch(() => {});
+    // or already settled from a successful finish(). Invoked immediately, but
+    // its settlement is awaited inside `work` below so cancel/shutdown cannot
+    // report completion before the Deepgram socket is disposed.
+    const sessionAbort = pendingSession?.abort().catch(() => {});
 
     const work = (async () => {
-      await pendingTranscription?.catch(() => {});
+      await Promise.all([pendingTranscription?.catch(() => {}), sessionAbort]);
       const staleRecorder = currentRecorder ?? (await pendingRecorder?.catch(() => null));
       try {
         await staleRecorder?.discard();
@@ -876,7 +892,15 @@ export default function (pi: ExtensionAPI, dependencies: Partial<DictateDependen
     if (config!.backend === "deepgram") {
       state = "connecting";
       startSpinner("connecting to Deepgram (remote)…");
-      const session = createSession(config!);
+      let session: DeepgramSession;
+      try {
+        session = createSession(config!);
+      } catch {
+        if (myGeneration !== generation) return;
+        notify(ctx, deepgramError("failed to start").message, "error");
+        await cleanup(false, myGeneration);
+        return;
+      }
       deepgramSession = session;
       try {
         await session.ready;

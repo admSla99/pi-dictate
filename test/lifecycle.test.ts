@@ -587,3 +587,48 @@ test("Deepgram lifecycle connects before capturing, streams audio, finalizes, an
   assert.equal(localCalls, 0);
   assert.equal(app.statuses.at(-1), undefined);
 });
+
+test("shutdown awaits an in-flight Deepgram abort before completing recorder disposal", async () => {
+  const fake = fakeRecorder();
+  let resolveReady!: () => void;
+  const ready = new Promise<void>((resolve) => (resolveReady = resolve));
+  let resolveAbort!: () => void;
+  const abortSettled = new Promise<void>((resolve) => (resolveAbort = resolve));
+  let abortCalls = 0;
+  const session = {
+    ready,
+    sendAudio() {},
+    async finish() { return "unused"; },
+    async abort() {
+      abortCalls++;
+      await abortSettled;
+    },
+  };
+  const app = await harness(
+    {
+      createDeepgramSession: () => session,
+      recordAudio: async () => fake.recorder,
+    },
+    deepgramEnv,
+  );
+
+  const starting = app.toggle();
+  await tick();
+  resolveReady();
+  await starting;
+  // Let the recorder's own startup microtask chain fully settle (its `await
+  // pending` continuation assigns `recorder`) before shutting down, so this
+  // test exercises the ordinary teardown path rather than the stale-generation
+  // discard branch inside beginCapture.
+  await tick();
+
+  const shutdown = app.shutdown();
+  await Promise.resolve();
+  assert.equal(abortCalls, 1);
+  assert.equal(fake.discardCount, 0, "cleanup must not dispose the recorder before Deepgram abort settles");
+
+  resolveAbort();
+  await shutdown;
+
+  assert.equal(fake.discardCount, 1);
+});
