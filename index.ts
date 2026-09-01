@@ -35,6 +35,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Key, matchesKey, isKeyRelease, isKeyRepeat } from "@earendil-works/pi-tui";
 import { spawn, type ChildProcessByStdio } from "node:child_process";
 import { appendFileSync } from "node:fs";
+import { access } from "node:fs/promises";
 import { availableParallelism, homedir } from "node:os";
 import { join } from "node:path";
 import type { Readable } from "node:stream";
@@ -143,6 +144,58 @@ export function parseTranscript(stdout: string): string {
     .join(" ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+/** Run whisper.cpp for a completed WAV recording. */
+export async function transcribeLocal(
+  wavPath: string,
+  seconds: number,
+  config: DictateConfig,
+  signal?: AbortSignal,
+): Promise<string> {
+  try {
+    await access(config.modelPath);
+  } catch {
+    throw new Error(`Whisper model not found; run scripts/convert-model.sh`);
+  }
+
+  const args = [
+    "-m",
+    config.modelPath,
+    "-f",
+    wavPath,
+    "-l",
+    config.language,
+    "-np",
+    "-t",
+    String(config.threads),
+    "-ac",
+    String(audioContext(seconds, config.audioContext)),
+  ];
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(config.whisperBin, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      signal,
+      killSignal: "SIGTERM",
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk: string) => (stdout += chunk));
+    child.stderr.setEncoding("utf8").on("data", (chunk: string) => (stderr += chunk));
+    let processError: NodeJS.ErrnoException | undefined;
+    child.on("error", (error: NodeJS.ErrnoException) => (processError = error));
+    child.on("close", (code) => {
+      if (processError) {
+        reject(
+          processError.code === "ENOENT"
+            ? new Error(`whisper-cli not found; run scripts/convert-model.sh`)
+            : processError,
+        );
+      } else if (code === 0) resolve(parseTranscript(stdout));
+      else reject(new Error(`whisper-cli exited with code ${code}: ${stderr.trim().slice(0, 500)}`));
+    });
+  });
 }
 
 /** Append normalized transcript text without changing existing target text. */
