@@ -16,7 +16,7 @@ import { join } from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
-type Backend = "local" | "litellm";
+type Backend = "local" | "litellm" | "deepgram";
 
 export interface DictateConfig {
   backend: Backend;
@@ -29,8 +29,11 @@ export interface DictateConfig {
   litellmUrl?: string;
   litellmApiKey?: string;
   litellmModel: string;
+  deepgramApiKey?: string;
   debug: boolean;
 }
+
+const DEEPGRAM_LISTEN_URL = "wss://api.deepgram.com/v1/listen";
 
 const positiveInteger = (name: string, value: string | undefined, fallback: number): number => {
   const parsed = value === undefined ? fallback : Number(value);
@@ -51,21 +54,31 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): DictateConfig 
     PI_DICTATE_LITELLM_URL,
     PI_DICTATE_LITELLM_API_KEY,
     PI_DICTATE_LITELLM_MODEL,
+    DEEPGRAM_API_KEY,
     DICTATE_DEBUG,
   } = env;
 
   const backend = PI_DICTATE_BACKEND ?? "local";
-  if (backend !== "local" && backend !== "litellm") {
-    throw new Error("PI_DICTATE_BACKEND must be 'local' or 'litellm'");
+  if (backend !== "local" && backend !== "litellm" && backend !== "deepgram") {
+    throw new Error("PI_DICTATE_BACKEND must be 'local', 'litellm', or 'deepgram'");
   }
   if (backend === "litellm" && !PI_DICTATE_LITELLM_URL) {
     throw new Error("PI_DICTATE_LITELLM_URL is required when PI_DICTATE_BACKEND=litellm");
+  }
+  if (backend === "deepgram" && !DEEPGRAM_API_KEY) {
+    throw new Error("DEEPGRAM_API_KEY is required when PI_DICTATE_BACKEND=deepgram");
+  }
+  const language = PI_DICTATE_LANGUAGE ?? "auto";
+  if (backend === "deepgram" && language === "auto") {
+    throw new Error(
+      "PI_DICTATE_LANGUAGE must be set explicitly (for example PI_DICTATE_LANGUAGE=sk) when PI_DICTATE_BACKEND=deepgram; 'auto' is not supported for streaming transcription",
+    );
   }
 
   return {
     backend,
     audioDevice: PI_DICTATE_AUDIO_DEVICE ?? "default",
-    language: PI_DICTATE_LANGUAGE ?? "auto",
+    language,
     threads: positiveInteger("PI_DICTATE_THREADS", PI_DICTATE_THREADS, Math.min(availableParallelism(), 8)),
     whisperBin: PI_DICTATE_WHISPER_BIN ?? "whisper-cli",
     modelPath:
@@ -77,8 +90,25 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): DictateConfig 
     litellmUrl: PI_DICTATE_LITELLM_URL,
     litellmApiKey: PI_DICTATE_LITELLM_API_KEY,
     litellmModel: PI_DICTATE_LITELLM_MODEL ?? "whisper-1",
+    deepgramApiKey: DEEPGRAM_API_KEY,
     debug: !!DICTATE_DEBUG,
   };
+}
+
+/** Build the Deepgram live-transcription URL; credentials are never included here. */
+export function deepgramListenUrl(config: DictateConfig): string {
+  const params = new URLSearchParams({
+    model: "nova-3",
+    language: config.language,
+    encoding: "linear16",
+    sample_rate: "16000",
+    channels: "1",
+    interim_results: "false",
+    smart_format: "true",
+    punctuate: "true",
+    endpointing: "300",
+  });
+  return `${DEEPGRAM_LISTEN_URL}?${params.toString()}`;
 }
 
 export function platformError(platform: NodeJS.Platform = process.platform): string | null {
