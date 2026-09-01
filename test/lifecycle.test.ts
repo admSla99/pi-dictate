@@ -25,7 +25,7 @@ function fakeRecorder(name = "recording.wav", discard = async () => {}) {
 
 async function harness(dependencies: Partial<DictateDependencies>, env: NodeJS.ProcessEnv = {}) {
   const events = new Map<string, (...args: any[]) => any>();
-  const shortcuts: Array<{ handler: (...args: any[]) => any }> = [];
+  let shortcutRegistrations = 0;
   const notifications: Array<{ message: string; level: string }> = [];
   const statuses: Array<string | undefined> = [];
   const editor = {
@@ -34,12 +34,8 @@ async function harness(dependencies: Partial<DictateDependencies>, env: NodeJS.P
     setText(text: string) { this.text = text; },
   };
   let inputListener: ((data: string) => unknown) | null = null;
-  const tui = {
+  const tui: { focusedComponent: any; requestRender(): void } = {
     focusedComponent: editor,
-    addInputListener(listener: (data: string) => unknown) {
-      inputListener = listener;
-      return () => { inputListener = null; };
-    },
     requestRender() {},
   };
   const ctx = {
@@ -48,6 +44,10 @@ async function harness(dependencies: Partial<DictateDependencies>, env: NodeJS.P
       theme: { fg: (_color: string, text: string) => text },
       setStatus: (_key: string, value: string | undefined) => statuses.push(value),
       notify: (message: string, level: string) => notifications.push({ message, level }),
+      onTerminalInput(listener: (data: string) => unknown) {
+        inputListener = listener;
+        return () => { inputListener = null; };
+      },
       getEditorText: () => editor.text,
       setEditorText: (text: string) => { editor.text = text; },
       setWidget: (_key: string, factory: (tui: any) => unknown) => factory(tui),
@@ -55,7 +55,7 @@ async function harness(dependencies: Partial<DictateDependencies>, env: NodeJS.P
   };
   const pi = {
     on: (name: string, handler: (...args: any[]) => any) => events.set(name, handler),
-    registerShortcut: (_key: unknown, shortcut: { handler: (...args: any[]) => any }) => shortcuts.push(shortcut),
+    registerShortcut: () => { shortcutRegistrations++; },
   };
 
   const previousEnv = new Map(Object.keys(env).map((key) => [key, process.env[key]]));
@@ -74,12 +74,35 @@ async function harness(dependencies: Partial<DictateDependencies>, env: NodeJS.P
     editor,
     notifications,
     statuses,
-    toggle: () => shortcuts[0]!.handler(ctx),
-    cancel: () => shortcuts[1]!.handler(ctx),
+    get shortcutRegistrations() { return shortcutRegistrations; },
+    focus(component: any) { tui.focusedComponent = component; },
+    async toggle() {
+      inputListener?.("\u001bm");
+      await new Promise((resolve) => setImmediate(resolve));
+    },
+    async cancel() {
+      inputListener?.("\u001bn");
+      await new Promise((resolve) => setImmediate(resolve));
+    },
     shutdown: () => events.get("session_shutdown")?.(),
     sendInput: (data: string) => inputListener?.(data),
   };
 }
+
+test("terminal shortcuts use the public listener and ignore repeat and release events", async () => {
+  const fake = fakeRecorder();
+  let starts = 0;
+  const app = await harness({ recordAudio: async () => { starts++; return fake.recorder; } });
+
+  assert.equal(app.shortcutRegistrations, 0);
+  assert.equal(app.sendInput("\u001b[109;3:2u"), undefined);
+  assert.equal(app.sendInput("\u001b[109;3:3u"), undefined);
+  assert.equal(starts, 0);
+  assert.deepEqual(app.sendInput("\u001bm"), { consume: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(starts, 1);
+  await app.cancel();
+});
 
 test("local lifecycle records, transcribes, inserts, and cleans up", async () => {
   const fake = fakeRecorder();
@@ -98,6 +121,40 @@ test("local lifecycle records, transcribes, inserts, and cleans up", async () =>
   assert.equal(app.editor.text, "Existing new words");
   assert.equal(fake.discardCount, 1);
   assert.equal(app.statuses.at(-1), undefined);
+});
+
+test("delivery types into a focused input component", async () => {
+  const fake = fakeRecorder();
+  let typed = "";
+  const app = await harness({
+    recordAudio: async () => fake.recorder,
+    transcribeLocal: async () => "new words",
+  });
+  app.focus({ handleInput: (text: string) => { typed += text; } });
+
+  await app.toggle();
+  await app.toggle();
+
+  assert.equal(typed, "new words");
+  assert.equal(app.editor.text, "Existing");
+});
+
+test("delivery falls back to the main editor when focus is absent", async () => {
+  const fake = fakeRecorder();
+  const app = await harness({
+    recordAudio: async () => fake.recorder,
+    transcribeLocal: async () => "new words",
+  });
+  app.focus(null);
+
+  await app.toggle();
+  await app.toggle();
+
+  assert.equal(app.editor.text, "Existing new words");
+  assert.deepEqual(app.notifications.at(-1), {
+    message: "Dictation inserted into the main editor because no input field is focused",
+    level: "warning",
+  });
 });
 
 test("a local transcription error inserts nothing and never falls back remotely", async () => {

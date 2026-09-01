@@ -331,15 +331,10 @@ export function appendText(current: string, addition: string): string {
 type State = "idle" | "recording" | "transcribing";
 
 // ── Focus-aware delivery ──────────────────────────────────────────────────
-// The TUI handle is captured once via a zero-height widget factory (the only
-// extension-API surface that exposes it). With it we can:
-//   1. Listen to ALL terminal input via tui.addInputListener — listeners run
-//      before the focused component, so alt+m works even while a custom
-//      dialog has stolen focus from the main editor (extension shortcuts are
-//      otherwise only matched by the main editor component).
-//   2. Inspect tui.focusedComponent to decide where the transcript goes.
-// `focusedComponent` is declared private in the typings but is a plain
-// runtime property — a benign peek, easily patched if pi internals change.
+// The public terminal-input listener catches shortcuts even when a dialog has
+// focus. A zero-height widget captures the TUI handle solely to inspect its
+// private focusedComponent property when choosing where to insert text. If pi
+// changes that property, delivery falls back to the public main-editor API.
 interface EditorLike {
   getText(): string;
   setText(text: string): void;
@@ -496,7 +491,7 @@ export default function (pi: ExtensionAPI, dependencies: Partial<DictateDependen
       return;
     }
     ctx.ui.setEditorText(appendText(ctx.ui.getEditorText() ?? "", text));
-    if (tuiHandle) ctx.ui.notify("Dictation inserted into the main editor because no input field is focused", "warning");
+    ctx.ui.notify("Dictation inserted into the main editor because no input field is focused", "warning");
   };
 
   const cleanup = (insert: boolean, expectedGeneration = generation): Promise<void> => {
@@ -636,10 +631,6 @@ export default function (pi: ExtensionAPI, dependencies: Partial<DictateDependen
     if (shuttingDown) return;
     lastCtx = ctx;
     if (state === "idle") {
-      if (tuiHandle && !resolveTarget()) {
-        ctx.ui.notify("No input field is focused — dictation not started", "warning");
-        return;
-      }
       await startDictation(ctx);
     } else if (state === "recording") {
       await stopDictation();
@@ -663,22 +654,13 @@ export default function (pi: ExtensionAPI, dependencies: Partial<DictateDependen
 
   pi.on("session_start", (_event, ctx) => {
     lastCtx = ctx;
-    if (ctx.mode !== "tui" || tuiHandle) return;
+    if (ctx.mode !== "tui") return;
+    removeInputListener?.();
+    removeInputListener = ctx.ui.onTerminalInput(onGlobalInput);
     ctx.ui.setWidget("dictate-tui-handle", (tui: any) => {
       tuiHandle = tui;
-      removeInputListener = tui.addInputListener(onGlobalInput);
       return { render: () => [], invalidate: () => {} };
     });
-  });
-
-  pi.registerShortcut(Key.alt("m"), {
-    description: "Toggle local voice dictation",
-    handler: toggleDictation,
-  });
-
-  pi.registerShortcut(Key.alt("n"), {
-    description: "Cancel voice dictation (discard transcript)",
-    handler: cancelDictation,
   });
 
   pi.on("session_shutdown", async () => {
