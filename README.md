@@ -117,7 +117,7 @@ Plaintext HTTP is accepted only for loopback endpoints. Backend selection is exp
 | Variable | Default | Purpose |
 |---|---|---|
 | `DEEPGRAM_API_KEY` | required | Deepgram API key, sent only through the WebSocket `token` subprotocol; never placed in the URL, logged, or included in error messages |
-| `PI_DICTATE_LANGUAGE` | must be set explicitly | e.g. `sk`; `auto` is rejected because Deepgram's streaming API cannot auto-detect language |
+| `PI_DICTATE_LANGUAGE` | must be set explicitly | e.g. `sk`; `auto` is not a Deepgram language value, so an explicit supported code must be chosen |
 
 Example:
 
@@ -138,7 +138,7 @@ This is the only backend that transmits audio off the machine while you are stil
 - **Shortcuts in tmux:** the default `alt` bindings use terminal sequences that tmux forwards without extended-key configuration.
 - **Text went to the main editor:** focus a text field before transcription finishes.
 - **`DEEPGRAM_API_KEY is required...`:** set a Deepgram API key before selecting `PI_DICTATE_BACKEND=deepgram`.
-- **Deepgram rejects `PI_DICTATE_LANGUAGE=auto`:** set an explicit code such as `sk`; Deepgram's streaming API cannot auto-detect language.
+- **Deepgram rejects `PI_DICTATE_LANGUAGE=auto`:** `auto` is not a Deepgram language value; set an explicit supported code such as `sk`.
 
 ## License
 

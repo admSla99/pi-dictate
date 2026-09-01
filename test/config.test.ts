@@ -90,6 +90,18 @@ test("readConfig rejects deepgram without an API key", () => {
   );
 });
 
+test("readConfig trims the deepgram API key and rejects a whitespace-only key", () => {
+  assert.equal(
+    readConfig({ PI_DICTATE_BACKEND: "deepgram", DEEPGRAM_API_KEY: "  dg_test_key  ", PI_DICTATE_LANGUAGE: "sk" })
+      .deepgramApiKey,
+    "dg_test_key",
+  );
+  assert.throws(
+    () => readConfig({ PI_DICTATE_BACKEND: "deepgram", DEEPGRAM_API_KEY: "   ", PI_DICTATE_LANGUAGE: "sk" }),
+    /DEEPGRAM_API_KEY is required when PI_DICTATE_BACKEND=deepgram/,
+  );
+});
+
 test("readConfig rejects deepgram with the default auto language", () => {
   assert.throws(
     () => readConfig({ PI_DICTATE_BACKEND: "deepgram", DEEPGRAM_API_KEY: "dg_test_key" }),

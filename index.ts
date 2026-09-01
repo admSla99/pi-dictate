@@ -65,7 +65,8 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): DictateConfig 
   if (backend === "litellm" && !PI_DICTATE_LITELLM_URL) {
     throw new Error("PI_DICTATE_LITELLM_URL is required when PI_DICTATE_BACKEND=litellm");
   }
-  if (backend === "deepgram" && !DEEPGRAM_API_KEY) {
+  const deepgramApiKey = DEEPGRAM_API_KEY?.trim() || undefined;
+  if (backend === "deepgram" && !deepgramApiKey) {
     throw new Error("DEEPGRAM_API_KEY is required when PI_DICTATE_BACKEND=deepgram");
   }
   const language = PI_DICTATE_LANGUAGE ?? "auto";
@@ -90,7 +91,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): DictateConfig 
     litellmUrl: PI_DICTATE_LITELLM_URL,
     litellmApiKey: PI_DICTATE_LITELLM_API_KEY,
     litellmModel: PI_DICTATE_LITELLM_MODEL ?? "whisper-1",
-    deepgramApiKey: DEEPGRAM_API_KEY,
+    deepgramApiKey,
     debug: !!DICTATE_DEBUG,
   };
 }

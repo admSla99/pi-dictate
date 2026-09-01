@@ -2,7 +2,7 @@
 
 Status: approved; implemented in `index.ts` per this contract. Manual acceptance testing with a real, dedicated non-production Deepgram API key is pending (see Success Criterion 8).
 
-This feature spec extends [`SPEC.md`](SPEC.md). It supersedes only the clauses that prohibit Deepgram and require every transcription to start after recording stops. All other current project constraints remain in force.
+This feature spec extends pi-dictate, a Linux-only voice dictation extension for [pi](https://github.com/badlogic/pi-mono) whose default backend transcribes locally with whisper.cpp and whose optional `litellm` backend posts a completed recording to an OpenAI-compatible endpoint. It supersedes only the clauses of that base design that prohibit Deepgram and require every transcription to start after recording stops. Every other current project constraint remains in force, including the local default, explicit backend selection, no automatic remote fallback, focus-aware delivery, and cleanup guarantees.
 
 ## Assumptions
 
