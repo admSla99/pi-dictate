@@ -107,8 +107,8 @@ test("terminal shortcuts use the public listener and ignore repeat and release e
 test("local lifecycle records, transcribes, inserts, and cleans up", async () => {
   const fake = fakeRecorder();
   const app = await harness({
-    recordAudio: async (_config, onLevel) => {
-      onLevel?.(0.5);
+    recordAudio: async (_config, options) => {
+      options?.onLevel?.(0.5);
       return fake.recorder;
     },
     transcribeLocal: async () => "new words",

@@ -465,12 +465,18 @@ export interface AudioRecorder {
   discard(): Promise<void>;
 }
 
+export interface RecordAudioOptions {
+  /** Called with a normalized RMS level (0..1) for each PCM chunk, for the status meter. */
+  onLevel?: (rms: number) => void;
+  /** Called once per PCM chunk with the exact raw bytes also written to the WAV payload. */
+  onAudio?: (chunk: Buffer) => void;
+  /** Override the `arecord` binary; primarily for tests. */
+  arecordBin?: string;
+}
+
 /** Capture 16 kHz mono PCM with arecord into a private temporary WAV file. */
-export async function recordAudio(
-  config: DictateConfig,
-  onLevel?: (rms: number) => void,
-  arecordBin = "arecord",
-): Promise<AudioRecorder> {
+export async function recordAudio(config: DictateConfig, options: RecordAudioOptions = {}): Promise<AudioRecorder> {
+  const { onLevel, onAudio, arecordBin = "arecord" } = options;
   const directory = await mkdtemp(join(tmpdir(), "pi-dictate-"));
   await chmod(directory, 0o700);
   const path = join(directory, "recording.wav");
@@ -481,6 +487,12 @@ export async function recordAudio(
     transform(chunk: Buffer, _encoding, callback) {
       pcmBytes += chunk.length;
       onLevel?.(rmsFromPcm16(chunk));
+      try {
+        onAudio?.(chunk);
+      } catch (error) {
+        callback(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
       callback(null, chunk);
     },
   });
@@ -818,12 +830,11 @@ export default function (pi: ExtensionAPI, dependencies: Partial<DictateDependen
     const myGeneration = ++generation;
     dbg(`start (gen ${myGeneration})`);
     startMeter();
-    const pending = startRecorder(
-      config!,
-      (level) => {
+    const pending = startRecorder(config!, {
+      onLevel: (level) => {
         if (myGeneration === generation) currentLevel = level;
       },
-    );
+    });
     recorderPromise = pending;
     try {
       const startedRecorder = await pending;
