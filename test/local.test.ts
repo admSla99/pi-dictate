@@ -38,7 +38,7 @@ test("transcribeLocal returns parsed output and passes safe whisper.cpp argument
     "-t",
     "4",
     "-ac",
-    "400",
+    "1500",
   ]);
   assert.ok(!args.includes("-nt"));
 });

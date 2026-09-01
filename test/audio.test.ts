@@ -21,9 +21,9 @@ test("wavHeader describes 16 kHz mono S16_LE PCM", () => {
   assert.equal(header.readUInt32LE(40), pcmBytes);
 });
 
-test("audioContext scales with recording length and clamps both ends", () => {
-  assert.equal(audioContext(0), 256);
-  assert.equal(audioContext(5), 400);
+test("audioContext uses the full encoder context at every recording length", () => {
+  assert.equal(audioContext(0), 1500);
+  assert.equal(audioContext(5), 1500);
   assert.equal(audioContext(30), 1500);
   assert.equal(audioContext(120), 1500);
 });

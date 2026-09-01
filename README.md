@@ -87,9 +87,9 @@ Environment variables are read when the extension loads. Set them before startin
 | `PI_DICTATE_WHISPER_BIN` | `whisper-cli` | Binary name or path |
 | `PI_DICTATE_MODEL_PATH` | `~/.local/share/pi-dictate/ggml-openai-large-v3-turbo-q5_0.bin` | Local GGML model |
 | `PI_DICTATE_THREADS` | available CPU cores, capped at 8 | Positive worker-thread count |
-| `PI_DICTATE_AUDIO_CONTEXT` | computed from recording duration | Positive override for whisper.cpp `-ac` |
+| `PI_DICTATE_AUDIO_CONTEXT` | `1500` | Positive override for whisper.cpp `-ac` |
 
-The computed audio context is `clamp(ceil(seconds / 30 × 1500) + 150, 256, 1500)`. Timestamps remain enabled so recordings longer than 30 seconds are processed in full; timestamp prefixes are removed before insertion.
+The full encoder context keeps multilingual decoding stable, including for short recordings. Timestamps remain enabled so recordings longer than 30 seconds are processed in full; timestamp prefixes are removed before insertion.
 
 ### LiteLLM backend
 

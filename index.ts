@@ -103,9 +103,9 @@ export function wavHeader(pcmBytes: number): Buffer {
   return header;
 }
 
-/** Size whisper.cpp's audio context to the recording unless explicitly overridden. */
-export function audioContext(seconds: number, override?: number): number {
-  return override ?? Math.max(256, Math.min(1500, Math.ceil((seconds / 30) * 1500) + 150));
+/** Keep whisper.cpp's full encoder context unless explicitly overridden. */
+export function audioContext(_seconds: number, override?: number): number {
+  return override ?? 1500;
 }
 
 /** Strip whisper.cpp timestamps and normalize its output to one line. */
