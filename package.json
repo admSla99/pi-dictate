@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "Local multilingual whisper.cpp voice dictation for pi on Linux",
+  "description": "Local multilingual whisper.cpp voice dictation for pi on Linux, with optional LiteLLM and Deepgram remote backends",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -13,7 +13,7 @@
   "bugs": {
     "url": "https://github.com/admSla99/pi-dictate/issues"
   },
-  "keywords": ["pi-package", "dictation", "speech-to-text", "whisper.cpp", "multilingual"],
+  "keywords": ["pi-package", "dictation", "speech-to-text", "whisper.cpp", "multilingual", "litellm", "deepgram"],
   "pi": {
     "extensions": ["./index.ts"]
   },
