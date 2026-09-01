@@ -123,6 +123,26 @@ test("local lifecycle records, transcribes, inserts, and cleans up", async () =>
   assert.equal(app.statuses.at(-1), undefined);
 });
 
+test("delivery appends through an editor nested in a focused dialog", async () => {
+  const fake = fakeRecorder();
+  const dialogEditor = {
+    text: "Dialog",
+    getText() { return this.text; },
+    setText(text: string) { this.text = text; },
+  };
+  const app = await harness({
+    recordAudio: async () => fake.recorder,
+    transcribeLocal: async () => "new words",
+  });
+  app.focus({ editor: dialogEditor });
+
+  await app.toggle();
+  await app.toggle();
+
+  assert.equal(dialogEditor.text, "Dialog new words");
+  assert.equal(app.editor.text, "Existing");
+});
+
 test("delivery types into a focused input component", async () => {
   const fake = fakeRecorder();
   let typed = "";

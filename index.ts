@@ -193,10 +193,16 @@ export async function transcribeLiteLLM(
     ? { Authorization: `Bearer ${config.litellmApiKey}` }
     : undefined;
   const response = await fetch(endpoint, { method: "POST", headers, body: form, signal, redirect: "error" });
+  const body = await response.text();
   if (!response.ok) {
-    throw new Error(`LiteLLM returned ${response.status}: ${(await response.text()).trim().slice(0, 500)}`);
+    throw new Error(`LiteLLM returned ${response.status}: ${body.trim().slice(0, 500)}`);
   }
-  const result: unknown = await response.json();
+  let result: unknown;
+  try {
+    result = JSON.parse(body);
+  } catch {
+    throw new Error(`LiteLLM returned invalid JSON: ${body.trim().slice(0, 500)}`);
+  }
   if (!result || typeof result !== "object" || typeof (result as { text?: unknown }).text !== "string") {
     throw new Error("LiteLLM returned invalid JSON: expected a text field");
   }

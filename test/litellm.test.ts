@@ -96,7 +96,10 @@ test("transcribeLiteLLM rejects malformed JSON", async (t) => {
     response.end("not json");
   });
 
-  await assert.rejects(transcribeLiteLLM(wavPath, configFor(url)));
+  await assert.rejects(
+    transcribeLiteLLM(wavPath, configFor(url)),
+    /LiteLLM returned invalid JSON: not json/,
+  );
 });
 
 test("transcribeLiteLLM honours AbortSignal", async (t) => {
