@@ -65,11 +65,11 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): DictateConfig 
   return {
     backend,
     audioDevice: PI_DICTATE_AUDIO_DEVICE ?? "default",
-    language: PI_DICTATE_LANGUAGE ?? "sk",
+    language: PI_DICTATE_LANGUAGE ?? "auto",
     threads: positiveInteger("PI_DICTATE_THREADS", PI_DICTATE_THREADS, Math.min(availableParallelism(), 8)),
     whisperBin: PI_DICTATE_WHISPER_BIN ?? "whisper-cli",
     modelPath:
-      PI_DICTATE_MODEL_PATH ?? join(homedir(), ".local", "share", "pi-dictate", "ggml-kinit-sk-v2-q5_0.bin"),
+      PI_DICTATE_MODEL_PATH ?? join(homedir(), ".local", "share", "pi-dictate", "ggml-large-v3-turbo-q5_0.bin"),
     audioContext:
       PI_DICTATE_AUDIO_CONTEXT === undefined
         ? undefined
@@ -187,7 +187,7 @@ export async function transcribeLiteLLM(
   const form = new FormData();
   form.append("file", await openAsBlob(wavPath, { type: "audio/wav" }), "recording.wav");
   form.append("model", config.litellmModel);
-  form.append("language", config.language);
+  if (config.language !== "auto") form.append("language", config.language);
   form.append("response_format", "json");
   const headers = config.litellmApiKey
     ? { Authorization: `Bearer ${config.litellmApiKey}` }

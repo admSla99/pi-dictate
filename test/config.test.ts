@@ -8,10 +8,10 @@ test("readConfig applies defaults", () => {
   assert.deepEqual(readConfig({}), {
     backend: "local",
     audioDevice: "default",
-    language: "sk",
+    language: "auto",
     threads: Math.min(availableParallelism(), 8),
     whisperBin: "whisper-cli",
-    modelPath: join(homedir(), ".local", "share", "pi-dictate", "ggml-kinit-sk-v2-q5_0.bin"),
+    modelPath: join(homedir(), ".local", "share", "pi-dictate", "ggml-large-v3-turbo-q5_0.bin"),
     audioContext: undefined,
     litellmUrl: undefined,
     litellmApiKey: undefined,

@@ -60,6 +60,23 @@ test("transcribeLiteLLM posts the OpenAI-compatible multipart request without op
   await requestReceived;
 });
 
+test("transcribeLiteLLM lets the server detect the language when configured as auto", async (t) => {
+  const wavPath = await fixture(t);
+  let body = "";
+  const { url } = await listen(t, async (request, response) => {
+    request.setEncoding("utf8");
+    for await (const chunk of request) body += chunk;
+    response.end(JSON.stringify({ text: "ok" }));
+  });
+  const config = readConfig({
+    PI_DICTATE_BACKEND: "litellm",
+    PI_DICTATE_LITELLM_URL: url,
+  });
+
+  assert.equal(await transcribeLiteLLM(wavPath, config), "ok");
+  assert.doesNotMatch(body, /name="language"/);
+});
+
 test("transcribeLiteLLM sends bearer auth only when configured", async (t) => {
   const wavPath = await fixture(t);
   const { url } = await listen(t, async (request, response) => {
