@@ -590,7 +590,7 @@ export function appendText(current: string, addition: string): string {
   return current + (current && !/\s$/.test(current) ? " " : "") + text;
 }
 
-type State = "idle" | "recording" | "transcribing";
+type State = "idle" | "connecting" | "recording" | "transcribing" | "finalizing";
 
 // ── Focus-aware delivery ──────────────────────────────────────────────────
 // The public terminal-input listener catches shortcuts even when a dialog has
@@ -650,12 +650,14 @@ export interface DictateDependencies {
   recordAudio: typeof recordAudio;
   transcribeLocal: typeof transcribeLocal;
   transcribeLiteLLM: typeof transcribeLiteLLM;
+  createDeepgramSession: typeof createDeepgramSession;
 }
 
 export default function (pi: ExtensionAPI, dependencies: Partial<DictateDependencies> = {}) {
   const startRecorder = dependencies.recordAudio ?? recordAudio;
   const transcribeLocally = dependencies.transcribeLocal ?? transcribeLocal;
   const transcribeRemotely = dependencies.transcribeLiteLLM ?? transcribeLiteLLM;
+  const createSession = dependencies.createDeepgramSession ?? createDeepgramSession;
   let config: DictateConfig | null = null;
   let configError: string | null = null;
   try {
@@ -674,6 +676,7 @@ export default function (pi: ExtensionAPI, dependencies: Partial<DictateDependen
   let state: State = "idle";
   let recorderPromise: Promise<AudioRecorder> | null = null;
   let recorder: AudioRecorder | null = null;
+  let deepgramSession: DeepgramSession | null = null;
   let transcriptionAbort: AbortController | null = null;
   let transcriptionPromise: Promise<string> | null = null;
   let cleanupPromise: Promise<void> | null = null;
@@ -766,6 +769,7 @@ export default function (pi: ExtensionAPI, dependencies: Partial<DictateDependen
     const pendingRecorder = recorderPromise;
     const currentRecorder = recorder;
     const pendingTranscription = transcriptionPromise;
+    const pendingSession = deepgramSession;
     const ctx = activeCtx;
     const text = transcript;
     const abort = transcriptionAbort;
@@ -774,6 +778,7 @@ export default function (pi: ExtensionAPI, dependencies: Partial<DictateDependen
     state = "transcribing";
     recorderPromise = null;
     recorder = null;
+    deepgramSession = null;
     transcriptionAbort = null;
     transcriptionPromise = null;
     transcript = "";
@@ -784,6 +789,9 @@ export default function (pi: ExtensionAPI, dependencies: Partial<DictateDependen
       ctx?.ui.setStatus("dictate", undefined);
     } catch {}
     abort?.abort();
+    // Idempotent: harmless whether the session is still connecting, mid-finalize,
+    // or already settled from a successful finish().
+    pendingSession?.abort().catch(() => {});
 
     const work = (async () => {
       await pendingTranscription?.catch(() => {});
@@ -813,27 +821,21 @@ export default function (pi: ExtensionAPI, dependencies: Partial<DictateDependen
     return work;
   };
 
-  const startDictation = async (ctx: ExtensionContext) => {
-    const unsupportedPlatform = platformError();
-    if (unsupportedPlatform) {
-      ctx.ui.notify(unsupportedPlatform, "error");
-      return;
-    }
-    if (configError) {
-      ctx.ui.notify(configError, "error");
-      return;
-    }
-
-    activeCtx = ctx;
-    transcript = "";
+  /** Start the recorder (shared by every backend) and wire its level meter, PCM forwarding, and failure reporting. */
+  const beginCapture = async (
+    ctx: ExtensionContext,
+    myGeneration: number,
+    forwardAudio?: (chunk: Buffer) => void,
+  ) => {
     state = "recording";
-    const myGeneration = ++generation;
-    dbg(`start (gen ${myGeneration})`);
     startMeter();
     const pending = startRecorder(config!, {
       onLevel: (level) => {
         if (myGeneration === generation) currentLevel = level;
       },
+      onAudio: forwardAudio && ((chunk) => {
+        if (myGeneration === generation) forwardAudio(chunk);
+      }),
     });
     recorderPromise = pending;
     try {
@@ -855,12 +857,78 @@ export default function (pi: ExtensionAPI, dependencies: Partial<DictateDependen
     }
   };
 
+  const startDictation = async (ctx: ExtensionContext) => {
+    const unsupportedPlatform = platformError();
+    if (unsupportedPlatform) {
+      ctx.ui.notify(unsupportedPlatform, "error");
+      return;
+    }
+    if (configError) {
+      ctx.ui.notify(configError, "error");
+      return;
+    }
+
+    activeCtx = ctx;
+    transcript = "";
+    const myGeneration = ++generation;
+    dbg(`start (gen ${myGeneration})`);
+
+    if (config!.backend === "deepgram") {
+      state = "connecting";
+      startSpinner("connecting to Deepgram (remote)…");
+      const session = createSession(config!);
+      deepgramSession = session;
+      try {
+        await session.ready;
+      } catch (error) {
+        if (myGeneration !== generation) return;
+        notify(ctx, error instanceof Error ? error.message : String(error), "error");
+        await cleanup(false, myGeneration);
+        return;
+      }
+      if (myGeneration !== generation) {
+        await session.abort();
+        return;
+      }
+      await beginCapture(ctx, myGeneration, (chunk) => session.sendAudio(chunk));
+      return;
+    }
+
+    await beginCapture(ctx, myGeneration);
+  };
+
   const stopDictation = async () => {
     if (state !== "recording" || !recorderPromise || !config) return;
-    state = "transcribing";
-    stopMeter();
-    startSpinner("transcribing…");
     const myGeneration = generation;
+    stopMeter();
+
+    if (config.backend === "deepgram") {
+      state = "finalizing";
+      startSpinner("finalizing…");
+      const session = deepgramSession;
+      try {
+        const currentRecorder = recorder ?? (await recorderPromise);
+        if (myGeneration !== generation) return;
+        recorder = currentRecorder;
+        await currentRecorder.stop();
+        if (myGeneration !== generation) return;
+        if (!session) throw new Error("Deepgram session is not available");
+        const pendingTranscription = session.finish();
+        transcriptionPromise = pendingTranscription;
+        const result = await pendingTranscription;
+        if (myGeneration !== generation) return;
+        transcript = result;
+        await cleanup(true, myGeneration);
+      } catch (error) {
+        if (myGeneration !== generation) return;
+        notify(activeCtx, error instanceof Error ? error.message : String(error), "error");
+        await cleanup(false, myGeneration);
+      }
+      return;
+    }
+
+    state = "transcribing";
+    startSpinner("transcribing…");
     try {
       const currentRecorder = recorder ?? (await recorderPromise);
       if (myGeneration !== generation) return;
@@ -885,7 +953,9 @@ export default function (pi: ExtensionAPI, dependencies: Partial<DictateDependen
   };
 
   const cancelDictation = async () => {
-    if (state === "recording" || state === "transcribing") await cleanup(false);
+    if (state === "connecting" || state === "recording" || state === "transcribing" || state === "finalizing") {
+      await cleanup(false);
+    }
   };
 
   const toggleDictation = async (ctx: ExtensionContext) => {

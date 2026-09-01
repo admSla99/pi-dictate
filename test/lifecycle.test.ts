@@ -23,6 +23,54 @@ function fakeRecorder(name = "recording.wav", discard = async () => {}) {
   return { recorder, fail, get discardCount() { return discardCount; } };
 }
 
+/**
+ * Fake Deepgram session. `ready` is controlled manually so tests can assert
+ * ordering around the connecting phase; `finish()` auto-resolves (or throws,
+ * for `finishResult` errors) on the next microtask, like `fakeRecorder`'s
+ * default quick `stop()`/`discard()`.
+ */
+function fakeDeepgramSession(finishResult: string | Error = "Ahoj svet.") {
+  let resolveReady!: () => void;
+  let rejectReady!: (error: Error) => void;
+  const ready = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
+  const sentAudio: Buffer[] = [];
+  let finishCalls = 0;
+  let abortCalls = 0;
+  const session = {
+    ready,
+    sendAudio(chunk: Buffer) {
+      sentAudio.push(chunk);
+    },
+    async finish() {
+      finishCalls++;
+      if (finishResult instanceof Error) throw finishResult;
+      return finishResult;
+    },
+    async abort() {
+      abortCalls++;
+    },
+  };
+  return {
+    session,
+    sentAudio,
+    openReady: () => resolveReady(),
+    failReady: (error: Error) => rejectReady(error),
+    get finishCalls() { return finishCalls; },
+    get abortCalls() { return abortCalls; },
+  };
+}
+
+const deepgramEnv: NodeJS.ProcessEnv = {
+  PI_DICTATE_BACKEND: "deepgram",
+  DEEPGRAM_API_KEY: "dg_test_key",
+  PI_DICTATE_LANGUAGE: "sk",
+};
+
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+
 async function harness(dependencies: Partial<DictateDependencies>, env: NodeJS.ProcessEnv = {}) {
   const events = new Map<string, (...args: any[]) => any>();
   let shortcutRegistrations = 0;
@@ -106,12 +154,14 @@ test("terminal shortcuts use the public listener and ignore repeat and release e
 
 test("local lifecycle records, transcribes, inserts, and cleans up", async () => {
   const fake = fakeRecorder();
+  let deepgramCalls = 0;
   const app = await harness({
     recordAudio: async (_config, options) => {
       options?.onLevel?.(0.5);
       return fake.recorder;
     },
     transcribeLocal: async () => "new words",
+    createDeepgramSession: () => { deepgramCalls++; throw new Error("should not be called"); },
   });
 
   await app.toggle();
@@ -121,6 +171,7 @@ test("local lifecycle records, transcribes, inserts, and cleans up", async () =>
   assert.equal(app.editor.text, "Existing new words");
   assert.equal(fake.discardCount, 1);
   assert.equal(app.statuses.at(-1), undefined);
+  assert.equal(deepgramCalls, 0);
 });
 
 test("delivery appends through an editor nested in a focused dialog", async () => {
@@ -199,10 +250,12 @@ test("LiteLLM transcription is selected only by explicit configuration", async (
   const fake = fakeRecorder();
   let localCalls = 0;
   let remoteCalls = 0;
+  let deepgramCalls = 0;
   const app = await harness({
     recordAudio: async () => fake.recorder,
     transcribeLocal: async () => { localCalls++; return "local"; },
     transcribeLiteLLM: async () => { remoteCalls++; return "remote"; },
+    createDeepgramSession: () => { deepgramCalls++; throw new Error("should not be called"); },
   }, {
     PI_DICTATE_BACKEND: "litellm",
     PI_DICTATE_LITELLM_URL: "https://llm.example/v1/audio/transcriptions",
@@ -214,6 +267,7 @@ test("LiteLLM transcription is selected only by explicit configuration", async (
   assert.equal(app.editor.text, "Existing remote");
   assert.equal(localCalls, 0);
   assert.equal(remoteCalls, 1);
+  assert.equal(deepgramCalls, 0);
 });
 
 test("cancel waits for the transcriber to terminate before deleting its WAV", async () => {
@@ -486,4 +540,50 @@ test("a cancelled stale transcription cannot affect the next dictation", async (
   await app.toggle();
   await app.toggle();
   assert.equal(app.editor.text, "Existing fresh");
+});
+
+test("Deepgram lifecycle connects before capturing, streams audio, finalizes, and delivers exactly once", async (t) => {
+  const dg = fakeDeepgramSession("Ahoj svet.");
+  const fake = fakeRecorder();
+  let recordCalls = 0;
+  let capturedOnAudio: ((chunk: Buffer) => void) | undefined;
+  let localCalls = 0;
+  const app = await harness(
+    {
+      createDeepgramSession: () => dg.session,
+      recordAudio: async (_config, options) => {
+        recordCalls++;
+        capturedOnAudio = options?.onAudio;
+        return fake.recorder;
+      },
+      transcribeLocal: async () => {
+        localCalls++;
+        return "should not be used";
+      },
+    },
+    deepgramEnv,
+  );
+  t.after(() => app.shutdown());
+
+  const starting = app.toggle();
+  await tick();
+  assert.equal(recordCalls, 0, "must not start capturing before the socket is ready");
+  const connectingStatus = app.statuses.at(-1) ?? "";
+  assert.match(connectingStatus, /connecting/i);
+  assert.match(connectingStatus, /deepgram/i);
+
+  dg.openReady();
+  await starting;
+  assert.equal(recordCalls, 1);
+
+  capturedOnAudio?.(Buffer.from([9, 9]));
+  assert.deepEqual(dg.sentAudio, [Buffer.from([9, 9])]);
+
+  await app.toggle();
+
+  assert.equal(dg.finishCalls, 1);
+  assert.equal(app.editor.text, "Existing Ahoj svet.");
+  assert.equal(fake.discardCount, 1);
+  assert.equal(localCalls, 0);
+  assert.equal(app.statuses.at(-1), undefined);
 });
