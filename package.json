@@ -3,14 +3,23 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "Minimal voice dictation for pi (Deepgram Nova-3 streaming)",
+  "description": "Local whisper.cpp Slovak voice dictation for pi on Linux",
   "license": "MIT",
-  "keywords": ["pi-package"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/admSla99/pi-dictate.git"
+  },
+  "homepage": "https://github.com/admSla99/pi-dictate#readme",
+  "bugs": {
+    "url": "https://github.com/admSla99/pi-dictate/issues"
+  },
+  "keywords": ["pi-package", "dictation", "speech-to-text", "whisper.cpp", "slovak"],
   "pi": {
     "extensions": ["./index.ts"]
   },
   "scripts": {
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "test": "node --test test/*.test.ts"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.80.10",
