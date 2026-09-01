@@ -34,11 +34,12 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, isKeyRelease, isKeyRepeat } from "@earendil-works/pi-tui";
 import { spawn, type ChildProcessByStdio } from "node:child_process";
-import { appendFileSync } from "node:fs";
-import { access } from "node:fs/promises";
-import { availableParallelism, homedir } from "node:os";
+import { appendFileSync, createWriteStream } from "node:fs";
+import { access, chmod, mkdtemp, open, rm } from "node:fs/promises";
+import { availableParallelism, homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Readable } from "node:stream";
+import { Transform, type Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 
 type Backend = "local" | "litellm";
 
@@ -196,6 +197,113 @@ export async function transcribeLocal(
       else reject(new Error(`whisper-cli exited with code ${code}: ${stderr.trim().slice(0, 500)}`));
     });
   });
+}
+
+export interface Recording {
+  path: string;
+  duration: number;
+}
+
+export interface AudioRecorder {
+  path: string;
+  stop(): Promise<Recording>;
+  discard(): Promise<void>;
+}
+
+/** Capture 16 kHz mono PCM with arecord into a private temporary WAV file. */
+export async function recordAudio(
+  config: DictateConfig,
+  onLevel?: (rms: number) => void,
+  arecordBin = "arecord",
+): Promise<AudioRecorder> {
+  const directory = await mkdtemp(join(tmpdir(), "pi-dictate-"));
+  await chmod(directory, 0o700);
+  const path = join(directory, "recording.wav");
+  const output = createWriteStream(path, { mode: 0o600 });
+  output.write(wavHeader(0));
+  let pcmBytes = 0;
+  const meter = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      pcmBytes += chunk.length;
+      onLevel?.(rmsFromPcm16(chunk));
+      callback(null, chunk);
+    },
+  });
+  const args = [
+    "-q",
+    ...(config.audioDevice === "default" ? [] : ["-D", config.audioDevice]),
+    "-f",
+    "S16_LE",
+    "-r",
+    "16000",
+    "-c",
+    "1",
+    "-t",
+    "raw",
+    "-",
+  ];
+  const child = spawn(arecordBin, args, { stdio: ["ignore", "pipe", "pipe"] });
+  const writing = pipeline(child.stdout, meter, output);
+  void writing.catch(() => {});
+  const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+    child.once("close", (code, signal) => resolve({ code, signal }));
+  });
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+  } catch (error) {
+    child.stdout.destroy();
+    await writing.catch(() => {});
+    await rm(directory, { recursive: true, force: true });
+    const message = (error as NodeJS.ErrnoException).code === "ENOENT"
+      ? "arecord not found; install alsa-utils"
+      : `Failed to start arecord: ${(error as Error).message}`;
+    throw new Error(message);
+  }
+
+  let stopPromise: Promise<Recording> | undefined;
+  let discardPromise: Promise<void> | undefined;
+  const stop = () => {
+    if (stopPromise) return stopPromise;
+    stopPromise = (async () => {
+      child.kill("SIGTERM");
+      const [exit] = await Promise.all([closed, writing]);
+      if (exit.code !== 0 && exit.signal !== "SIGTERM") {
+        throw new Error(`arecord exited unexpectedly (code ${exit.code})`);
+      }
+      const file = await open(path, "r+");
+      try {
+        await file.write(wavHeader(pcmBytes), 0, 44, 0);
+      } finally {
+        await file.close();
+      }
+      return { path, duration: pcmBytes / 32_000 };
+    })().catch(async (error) => {
+      await rm(directory, { recursive: true, force: true });
+      throw error;
+    });
+    return stopPromise;
+  };
+
+  return {
+    path,
+    stop,
+    discard() {
+      if (discardPromise) return discardPromise;
+      discardPromise = (async () => {
+        if (stopPromise) await stopPromise.catch(() => {});
+        else {
+          child.kill("SIGTERM");
+          await Promise.allSettled([closed, writing]);
+        }
+        await rm(directory, { recursive: true, force: true });
+      })();
+      return discardPromise;
+    },
+  };
 }
 
 /** Append normalized transcript text without changing existing target text. */
