@@ -116,6 +116,17 @@ test("readConfig never echoes the deepgram API key in its error messages", () =>
   });
 });
 
+test("readConfig never echoes a supplied deepgram API key when a different validation fails", () => {
+  assert.throws(
+    () => readConfig({ PI_DICTATE_BACKEND: "deepgram", DEEPGRAM_API_KEY: "dg_test_key" }),
+    (error: Error) => {
+      assert.match(error.message, /'auto'/);
+      assert.doesNotMatch(error.message, /dg_test_key/);
+      return true;
+    },
+  );
+});
+
 test("platform guard explains that dictation is Linux-only", () => {
   assert.equal(platformError("linux"), null);
   assert.match(platformError("darwin")!, /Linux only.*darwin/);

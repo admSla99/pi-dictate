@@ -115,6 +115,220 @@ export function platformError(platform: NodeJS.Platform = process.platform): str
   return platform === "linux" ? null : `pi-dictate supports Linux only; current platform is ${platform}`;
 }
 
+export interface DeepgramSession {
+  ready: Promise<void>;
+  sendAudio(chunk: Buffer): void;
+  finish(): Promise<string>;
+  abort(): Promise<void>;
+}
+
+type DeepgramWebSocketFactory = (url: string, protocols: string[]) => WebSocket;
+
+export interface DeepgramSessionOptions {
+  webSocketFactory?: DeepgramWebSocketFactory;
+  finishTimeoutMs?: number;
+  setTimeout?: (callback: () => void, ms: number) => unknown;
+  clearTimeout?: (handle: unknown) => void;
+}
+
+const DEEPGRAM_FINISH_TIMEOUT_MS = 3000;
+
+/** Build a sanitized connection error; never includes the API key or raw socket details. */
+function deepgramError(reason: string): Error {
+  return new Error(`Deepgram connection ${reason}`);
+}
+
+/** Extract a non-empty transcript from a final Deepgram `Results` message, ignoring anything else. */
+function finalTranscript(data: unknown): string | undefined {
+  if (typeof data !== "string") return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(data);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object") return undefined;
+  const message = parsed as {
+    type?: unknown;
+    is_final?: unknown;
+    channel?: { alternatives?: Array<{ transcript?: unknown }> };
+  };
+  if (message.type !== "Results" || message.is_final !== true) return undefined;
+  const transcript = message.channel?.alternatives?.[0]?.transcript;
+  return typeof transcript === "string" && transcript.trim().length > 0 ? transcript : undefined;
+}
+
+type DeepgramFinishResult = { ok: true; value: string } | { ok: false; error: Error };
+
+/**
+ * Open a native-WebSocket streaming session against Deepgram's live-transcription
+ * endpoint. Returns immediately; `ready` resolves once the socket has opened.
+ * Credentials travel only through the `token` subprotocol and never appear in
+ * the URL, in sent frames, or in any error this session produces.
+ */
+export function createDeepgramSession(config: DictateConfig, options: DeepgramSessionOptions = {}): DeepgramSession {
+  const factory = options.webSocketFactory ?? ((url, protocols) => new WebSocket(url, protocols));
+  const finishTimeoutMs = options.finishTimeoutMs ?? DEEPGRAM_FINISH_TIMEOUT_MS;
+  const scheduleTimeout =
+    options.setTimeout ??
+    ((callback: () => void, ms: number) => {
+      const timer = setTimeout(callback, ms);
+      timer.unref?.();
+      return timer;
+    });
+  const cancelTimeout = options.clearTimeout ?? ((handle: unknown) => clearTimeout(handle as NodeJS.Timeout));
+  const socket = factory(deepgramListenUrl(config), ["token", config.deepgramApiKey ?? ""]);
+
+  const transcripts: string[] = [];
+  let opened = false;
+
+  let readyResolve!: () => void;
+  let readyReject!: (error: Error) => void;
+  const ready = new Promise<void>((resolve, reject) => {
+    readyResolve = resolve;
+    readyReject = reject;
+  });
+  ready.catch(() => {});
+
+  let settleFinish: ((value: string) => void) | undefined;
+  let rejectFinish: ((error: Error) => void) | undefined;
+  let finishPromise: Promise<string> | undefined;
+  let abortPromise: Promise<void> | undefined;
+  let finishTimer: unknown;
+  let cleanedUp = false;
+  // The socket can terminate (close/error) before finish() is ever called; remember
+  // that single outcome so a later finish() settles immediately instead of resending
+  // CloseStream and timing out against a socket that is already gone.
+  let terminalResult: DeepgramFinishResult | undefined;
+
+  const clearFinishTimer = () => {
+    if (finishTimer !== undefined) {
+      cancelTimeout(finishTimer);
+      finishTimer = undefined;
+    }
+  };
+
+  const cleanup = () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    clearFinishTimer();
+  };
+
+  const closeBestEffort = () => {
+    try {
+      socket.close();
+    } catch {
+      // ignore: socket may already be closing or closed
+    }
+  };
+
+  // A memoized finishPromise may sit unawaited for a while (e.g. it is handed
+  // back immediately from a stored terminal result, or rejects synchronously
+  // inside its executor). Attach a no-op handler the instant it is created so
+  // a delayed `await` from the caller can never surface as an unhandled
+  // rejection; the original promise returned to callers is unaffected.
+  const suppressUnhandledRejection = (promise: Promise<unknown>): void => {
+    promise.catch(() => {});
+  };
+
+  const settleFinishOnce = (result: DeepgramFinishResult) => {
+    if (!settleFinish && !rejectFinish) return;
+    const resolve = settleFinish;
+    const reject = rejectFinish;
+    settleFinish = undefined;
+    rejectFinish = undefined;
+    clearFinishTimer();
+    if (result.ok) resolve?.(result.value);
+    else reject?.(result.error);
+  };
+
+  /** Record the socket's single terminal outcome; later finish() calls reuse it. */
+  const recordTerminal = (result: DeepgramFinishResult) => {
+    if (terminalResult) return;
+    terminalResult = result;
+    settleFinishOnce(result);
+  };
+
+  socket.addEventListener("open", () => {
+    opened = true;
+    readyResolve();
+  });
+
+  socket.addEventListener("message", (event) => {
+    const transcript = finalTranscript((event as MessageEvent).data);
+    if (transcript) transcripts.push(transcript);
+  });
+
+  socket.addEventListener("error", () => {
+    const error = deepgramError("failed");
+    if (!opened) readyReject(error);
+    recordTerminal({ ok: false, error });
+    cleanup();
+    closeBestEffort();
+  });
+
+  socket.addEventListener("close", (event) => {
+    const code = (event as CloseEvent).code;
+    if (!opened) readyReject(deepgramError("closed before it was ready"));
+    if (code === 1000) {
+      recordTerminal({ ok: true, value: transcripts.join(" ").replace(/\s+/g, " ").trim() });
+    } else {
+      recordTerminal({ ok: false, error: deepgramError(`closed unexpectedly (code ${code})`) });
+    }
+    cleanup();
+  });
+
+  const sendAudio = (chunk: Buffer): void => {
+    socket.send(chunk);
+  };
+
+  const finish = (): Promise<string> => {
+    if (finishPromise) return finishPromise;
+    if (terminalResult) {
+      finishPromise = terminalResult.ok ? Promise.resolve(terminalResult.value) : Promise.reject(terminalResult.error);
+      suppressUnhandledRejection(finishPromise);
+      return finishPromise;
+    }
+    finishPromise = new Promise<string>((resolve, reject) => {
+      settleFinish = resolve;
+      rejectFinish = reject;
+      try {
+        socket.send(JSON.stringify({ type: "CloseStream" }));
+      } catch {
+        // Distinguish a still-connecting socket (an actionable caller mistake:
+        // finish() must be called only after `ready` resolves) from a send
+        // failure on an otherwise-open socket.
+        const error = opened
+          ? deepgramError("failed to send CloseStream")
+          : deepgramError("cannot send CloseStream before the socket is open; call finish() only after ready resolves");
+        recordTerminal({ ok: false, error });
+        cleanup();
+        closeBestEffort();
+        return;
+      }
+      finishTimer = scheduleTimeout(() => {
+        recordTerminal({ ok: false, error: deepgramError("timed out waiting for finalization") });
+        closeBestEffort();
+      }, finishTimeoutMs);
+    });
+    suppressUnhandledRejection(finishPromise);
+    return finishPromise;
+  };
+
+  const abort = async (): Promise<void> => {
+    if (abortPromise) return abortPromise;
+    abortPromise = (async () => {
+      recordTerminal({ ok: false, error: deepgramError("aborted") });
+      if (!opened) readyReject(deepgramError("cancelled while connecting"));
+      cleanup();
+      closeBestEffort();
+    })();
+    return abortPromise;
+  };
+
+  return { ready, sendAudio, finish, abort };
+}
+
 /** Build a 44-byte WAV header for finished 16 kHz mono S16_LE PCM. */
 export function wavHeader(pcmBytes: number): Buffer {
   const header = Buffer.alloc(44);
