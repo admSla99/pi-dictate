@@ -6,9 +6,9 @@ set -euo pipefail
 PREFIX="${PREFIX:-$HOME/.local}"
 BIN_DIR="$PREFIX/bin"
 MODEL_DIR="$PREFIX/share/pi-dictate"
-MODEL_NAME="ggml-large-v3-turbo-q5_0.bin"
+MODEL_NAME="ggml-openai-large-v3-turbo-q5_0.bin"
 MODEL_PATH="$MODEL_DIR/$MODEL_NAME"
-MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$MODEL_NAME"
+MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin"
 MODEL_SHA1="e050f7970618a659205450ad97eb95a18d69c9ee"
 
 mkdir -p "$BIN_DIR" "$MODEL_DIR"

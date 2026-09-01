@@ -69,7 +69,7 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): DictateConfig 
     threads: positiveInteger("PI_DICTATE_THREADS", PI_DICTATE_THREADS, Math.min(availableParallelism(), 8)),
     whisperBin: PI_DICTATE_WHISPER_BIN ?? "whisper-cli",
     modelPath:
-      PI_DICTATE_MODEL_PATH ?? join(homedir(), ".local", "share", "pi-dictate", "ggml-large-v3-turbo-q5_0.bin"),
+      PI_DICTATE_MODEL_PATH ?? join(homedir(), ".local", "share", "pi-dictate", "ggml-openai-large-v3-turbo-q5_0.bin"),
     audioContext:
       PI_DICTATE_AUDIO_CONTEXT === undefined
         ? undefined
