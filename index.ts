@@ -252,11 +252,9 @@ export async function recordAudio(
     if (stopPromise) return stopPromise;
     stopPromise = (async () => {
       stopping = true;
-      child.kill("SIGTERM");
+      const signalled = child.kill("SIGTERM");
       const [exit] = await Promise.all([closed, writing]);
-      if (exit.code !== 0 && exit.signal !== "SIGTERM") {
-        throw new Error(`arecord exited unexpectedly (code ${exit.code})`);
-      }
+      if (!signalled) throw new Error(`arecord exited unexpectedly (code ${exit.code})`);
       const file = await open(path, "r+");
       try {
         await file.write(wavHeader(pcmBytes), 0, 44, 0);
