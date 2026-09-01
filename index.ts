@@ -34,19 +34,82 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, isKeyRelease, isKeyRepeat } from "@earendil-works/pi-tui";
 import { spawn, type ChildProcessByStdio } from "node:child_process";
-import type { Readable } from "node:stream";
 import { appendFileSync } from "node:fs";
+import { availableParallelism, homedir } from "node:os";
+import { join } from "node:path";
+import type { Readable } from "node:stream";
 
-// Optional forensic logging: run pi with DICTATE_DEBUG=1 to append timestamped
-// lifecycle events (listener hits, toggles, ws open/error/close with their
-// generation) to /tmp/dictate-debug.log.
-const DEBUG = !!process.env.DICTATE_DEBUG;
-const dbg = (msg: string) => {
-  if (!DEBUG) return;
-  try {
-    appendFileSync("/tmp/dictate-debug.log", `${new Date().toISOString()} ${msg}\n`);
-  } catch {}
+type Backend = "local" | "litellm";
+
+export interface DictateConfig {
+  backend: Backend;
+  audioDevice: string;
+  language: string;
+  threads: number;
+  whisperBin: string;
+  modelPath: string;
+  audioContext?: number;
+  litellmUrl?: string;
+  litellmApiKey?: string;
+  litellmModel: string;
+  debug: boolean;
+  deepgramApiKey?: string;
+}
+
+const positiveInteger = (name: string, value: string | undefined, fallback: number): number => {
+  const parsed = value === undefined ? fallback : Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1) throw new Error(`${name} must be a positive integer`);
+  return parsed;
 };
+
+/** Read extension configuration from the environment once per extension load. */
+export function readConfig(env: NodeJS.ProcessEnv = process.env): DictateConfig {
+  const {
+    PI_DICTATE_BACKEND,
+    PI_DICTATE_AUDIO_DEVICE,
+    PI_DICTATE_LANGUAGE,
+    PI_DICTATE_THREADS,
+    PI_DICTATE_WHISPER_BIN,
+    PI_DICTATE_MODEL_PATH,
+    PI_DICTATE_AUDIO_CONTEXT,
+    PI_DICTATE_LITELLM_URL,
+    PI_DICTATE_LITELLM_API_KEY,
+    PI_DICTATE_LITELLM_MODEL,
+    DICTATE_DEBUG,
+    DEEPGRAM_API_KEY,
+  } = env;
+
+  const backend = PI_DICTATE_BACKEND ?? "local";
+  if (backend !== "local" && backend !== "litellm") {
+    throw new Error("PI_DICTATE_BACKEND must be 'local' or 'litellm'");
+  }
+  if (backend === "litellm" && !PI_DICTATE_LITELLM_URL) {
+    throw new Error("PI_DICTATE_LITELLM_URL is required when PI_DICTATE_BACKEND=litellm");
+  }
+
+  return {
+    backend,
+    audioDevice: PI_DICTATE_AUDIO_DEVICE ?? "default",
+    language: PI_DICTATE_LANGUAGE ?? "sk",
+    threads: positiveInteger("PI_DICTATE_THREADS", PI_DICTATE_THREADS, Math.min(availableParallelism(), 8)),
+    whisperBin: PI_DICTATE_WHISPER_BIN ?? "whisper-cli",
+    modelPath:
+      PI_DICTATE_MODEL_PATH ?? join(homedir(), ".local", "share", "pi-dictate", "ggml-kinit-sk-v2-q5_0.bin"),
+    audioContext:
+      PI_DICTATE_AUDIO_CONTEXT === undefined
+        ? undefined
+        : positiveInteger("PI_DICTATE_AUDIO_CONTEXT", PI_DICTATE_AUDIO_CONTEXT, 1),
+    litellmUrl: PI_DICTATE_LITELLM_URL,
+    litellmApiKey: PI_DICTATE_LITELLM_API_KEY,
+    litellmModel: PI_DICTATE_LITELLM_MODEL ?? "whisper-1",
+    debug: !!DICTATE_DEBUG,
+    deepgramApiKey: DEEPGRAM_API_KEY,
+  };
+}
+
+export function platformError(platform: NodeJS.Platform = process.platform): string | null {
+  return platform === "linux" ? null : `pi-dictate supports Linux only; current platform is ${platform}`;
+}
 
 // Deepgram streaming endpoint. Tuning notes:
 //   model=nova-3        — flagship, sub-300ms latency, best accuracy
@@ -129,6 +192,23 @@ function rmsToBlock(rms: number): string {
 }
 
 export default function (pi: ExtensionAPI) {
+  let config: DictateConfig | null = null;
+  let configError: string | null = null;
+  try {
+    config = readConfig();
+  } catch (error) {
+    configError = error instanceof Error ? error.message : String(error);
+  }
+
+  // Optional forensic logging: run pi with DICTATE_DEBUG=1 to append timestamped
+  // lifecycle events to /tmp/dictate-debug.log.
+  const dbg = (msg: string) => {
+    if (!config?.debug) return;
+    try {
+      appendFileSync("/tmp/dictate-debug.log", `${new Date().toISOString()} ${msg}\n`);
+    } catch {}
+  };
+
   let state: State = "idle";
   let rec: ChildProcessByStdio<null, Readable, Readable> | null = null;
   let ws: WebSocket | null = null;
@@ -301,7 +381,17 @@ export default function (pi: ExtensionAPI) {
   };
 
   const startDictation = (ctx: ExtensionContext) => {
-    const apiKey = process.env.DEEPGRAM_API_KEY;
+    const unsupportedPlatform = platformError();
+    if (unsupportedPlatform) {
+      ctx.ui.notify(unsupportedPlatform, "error");
+      return;
+    }
+    if (configError) {
+      ctx.ui.notify(configError, "error");
+      return;
+    }
+
+    const apiKey = config!.deepgramApiKey;
     if (!apiKey) {
       ctx.ui.notify("DEEPGRAM_API_KEY not set in environment", "error");
       return;
