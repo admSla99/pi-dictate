@@ -129,7 +129,7 @@ export async function transcribeLocal(
   try {
     await access(config.modelPath);
   } catch {
-    throw new Error(`Whisper model not found; run scripts/convert-model.sh`);
+    throw new Error(`Whisper model not found; run scripts/install-whisper.sh`);
   }
 
   const args = [
@@ -162,7 +162,7 @@ export async function transcribeLocal(
       if (processError) {
         reject(
           processError.code === "ENOENT"
-            ? new Error(`whisper-cli not found; run scripts/convert-model.sh`)
+            ? new Error(`whisper-cli not found; run scripts/install-whisper.sh`)
             : processError,
         );
       } else if (code === 0) resolve(parseTranscript(stdout));
