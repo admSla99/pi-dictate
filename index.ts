@@ -134,6 +134,24 @@ export function audioContext(seconds: number, override?: number): number {
   return override ?? Math.max(256, Math.min(1500, Math.ceil((seconds / 30) * 1500) + 150));
 }
 
+/** Strip whisper.cpp timestamps and normalize its output to one line. */
+export function parseTranscript(stdout: string): string {
+  return stdout
+    .split("\n")
+    .map((line) => line.replace(/^\[[\d:.]+ --> [\d:.]+\]\s*/, "").trim())
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Append normalized transcript text without changing existing target text. */
+export function appendText(current: string, addition: string): string {
+  const text = addition.replace(/\s+/g, " ").trim();
+  if (!text) return current;
+  return current + (current && !/\s$/.test(current) ? " " : "") + text;
+}
+
 // Deepgram streaming endpoint. Tuning notes:
 //   model=nova-3        — flagship, sub-300ms latency, best accuracy
 //   encoding=linear16   — raw 16-bit PCM (what sox/rec gives us with -e signed-integer -b 16)
@@ -340,8 +358,7 @@ export default function (pi: ExtensionAPI) {
     // append to the main chat editor exactly as before.
     if (!tuiHandle) {
       const current = activeCtx.ui.getEditorText() ?? "";
-      const sep = current && !/\s$/.test(current) ? " " : "";
-      activeCtx.ui.setEditorText(current + sep + text);
+      activeCtx.ui.setEditorText(appendText(current, text));
       return;
     }
 
@@ -349,8 +366,7 @@ export default function (pi: ExtensionAPI) {
     const target = resolveTarget();
     if (target?.kind === "editor") {
       const current = target.editor.getText() ?? "";
-      const sep = current && !/\s$/.test(current) ? " " : "";
-      target.editor.setText(current + sep + text);
+      target.editor.setText(appendText(current, text));
       tuiHandle.requestRender?.();
       return;
     }
