@@ -59,15 +59,15 @@ test("transcribeLocal explains how to install a missing binary", async (t) => {
   t.after(() => rm(fixture.dir, { recursive: true, force: true }));
   fixture.config.whisperBin = join(fixture.dir, "missing-whisper-cli");
 
-  await assert.rejects(transcribeLocal(fixture.wavPath, 5, fixture.config), /scripts\/convert-model\.sh/);
+  await assert.rejects(transcribeLocal(fixture.wavPath, 5, fixture.config), /scripts\/install-whisper\.sh/);
 });
 
-test("transcribeLocal explains how to create a missing model", async (t) => {
+test("transcribeLocal explains how to install a missing model", async (t) => {
   const fixture = await setup();
   t.after(() => rm(fixture.dir, { recursive: true, force: true }));
   fixture.config.modelPath = join(fixture.dir, "missing-model.bin");
 
-  await assert.rejects(transcribeLocal(fixture.wavPath, 5, fixture.config), /scripts\/convert-model\.sh/);
+  await assert.rejects(transcribeLocal(fixture.wavPath, 5, fixture.config), /scripts\/install-whisper\.sh/);
 });
 
 test("transcribeLocal aborts whisper-cli with SIGTERM", async (t) => {
