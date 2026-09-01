@@ -2,6 +2,8 @@
 
 Linux voice dictation for [pi](https://github.com/badlogic/pi-mono), with local Slovak inference through whisper.cpp and an optional LiteLLM backend.
 
+This is a fork of [amosblomqvist/pi-dictate](https://github.com/amosblomqvist/pi-dictate), focused on local whisper.cpp inference with optional LiteLLM, for Linux only.
+
 - `alt+m`: start recording; press again to stop and transcribe
 - `alt+n`: cancel recording or transcription without inserting text
 - Audio: 16 kHz mono S16_LE through `arecord`
@@ -24,7 +26,7 @@ sudo apt install alsa-utils build-essential git curl python3-venv
 ## Install
 
 ```bash
-pi install git:github.com/amosblomqvist/pi-dictate
+pi install git:github.com/admSla99/pi-dictate
 ```
 
 Run `/reload` in pi after installation or after changing configuration.
@@ -34,7 +36,7 @@ Run `/reload` in pi after installation or after changing configuration.
 The default backend needs `whisper-cli` and a converted GGML model. Clone this repository and run the included one-time conversion script:
 
 ```bash
-git clone https://github.com/amosblomqvist/pi-dictate.git
+git clone https://github.com/admSla99/pi-dictate.git
 cd pi-dictate
 ./scripts/convert-model.sh
 ```

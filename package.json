@@ -5,6 +5,14 @@
   "type": "module",
   "description": "Local whisper.cpp Slovak voice dictation for pi on Linux",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/admSla99/pi-dictate.git"
+  },
+  "homepage": "https://github.com/admSla99/pi-dictate#readme",
+  "bugs": {
+    "url": "https://github.com/admSla99/pi-dictate/issues"
+  },
   "keywords": ["pi-package", "dictation", "speech-to-text", "whisper.cpp", "slovak"],
   "pi": {
     "extensions": ["./index.ts"]
