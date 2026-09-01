@@ -17,7 +17,6 @@ test("readConfig applies defaults", () => {
     litellmApiKey: undefined,
     litellmModel: "whisper-1",
     debug: false,
-    deepgramApiKey: undefined,
   });
 });
 
@@ -35,7 +34,6 @@ test("readConfig applies environment overrides", () => {
       PI_DICTATE_LITELLM_API_KEY: "test-key",
       PI_DICTATE_LITELLM_MODEL: "whisper-large",
       DICTATE_DEBUG: "1",
-      DEEPGRAM_API_KEY: "legacy-key",
     }),
     {
       backend: "litellm",
@@ -49,7 +47,6 @@ test("readConfig applies environment overrides", () => {
       litellmApiKey: "test-key",
       litellmModel: "whisper-large",
       debug: true,
-      deepgramApiKey: "legacy-key",
     },
   );
 });

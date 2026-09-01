@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, chmod, copyFile, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { access, chmod, copyFile, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -8,11 +8,12 @@ import { readConfig, recordAudio } from "../index.ts";
 const fakeArecordFixture = join(import.meta.dirname, "fixtures", "fake-arecord.sh");
 const config = () => readConfig({ PI_DICTATE_AUDIO_DEVICE: "hw:1,0" });
 
-async function setupFakeArecord() {
+async function setupFakeArecord(fail = false) {
   const dir = await mkdtemp(join(tmpdir(), "pi-dictate-fake-arecord-"));
   const bin = join(dir, "arecord");
   await copyFile(fakeArecordFixture, bin);
   await chmod(bin, 0o755);
+  if (fail) await writeFile(`${bin}.fail`, "");
   return { dir, bin };
 }
 
@@ -57,6 +58,24 @@ test("recordAudio discard kills arecord and removes its temporary directory", as
 
   await recorder.discard();
   await assert.rejects(access(directory), { code: "ENOENT" });
+});
+
+test("recordAudio exposes an unexpected arecord exit", async (t) => {
+  const fake = await setupFakeArecord(true);
+  t.after(() => rm(fake.dir, { recursive: true, force: true }));
+  const recorder = await recordAudio(config(), undefined, fake.bin);
+  t.after(() => recorder.discard());
+
+  const error = await Promise.race([
+    recorder.failure,
+    new Promise<Error>((_resolve, reject) => {
+      setTimeout(() => reject(new Error("timed out")), 500).unref();
+    }),
+  ]);
+
+  assert.ok(error);
+  assert.match(error.message, /arecord exited unexpectedly \(code 9\)/);
+  await recorder.discard();
 });
 
 test("recordAudio names alsa-utils when arecord is missing", async () => {

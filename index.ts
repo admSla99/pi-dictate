@@ -1,44 +1,19 @@
 /**
- * dictate — minimal voice dictation for pi.
+ * Linux-native voice dictation for pi.
  *
- * Press alt+m to start, press it again to stop.
- * Press alt+n to cancel and discard the in-flight transcript.
- *
- * Focus-aware: alt+m/alt+n are intercepted at the TUI input layer (before any
- * focused component), so dictation works inside ANY dialog — quiz popups,
- * ask_user_question, ctx.ui.editor()/input() — not just the main chat editor.
- *
- * Start rule: dictation only begins if some text-capable component is
- * focused; otherwise an ephemeral notification explains why nothing happened.
- * Opaque dialogs (quiz/ask selects) count as text-capable, but their internal
- * focus is invisible to us — Tab into the note/Other field first so the text
- * lands there.
- *
- * Stop rule: the delivery target is resolved fresh at stop time and the
- * transcript goes to whatever is focused THEN (editor-like components get a
- * direct setText append; opaque components get synthetic keystrokes). If
- * nothing text-capable is focused at stop, the transcript is copied to the
- * clipboard and a notification says so — a finished dictation is never lost.
- *
- * Requires:
- *   - sox installed (`brew install sox` — provides the `rec` command)
- *   - DEEPGRAM_API_KEY environment variable set
- *
- * Streaming model: audio is sent to Deepgram while you talk; the server
- * transcribes in real time and emits per-utterance "final" results. We
- * collect those finals and inject the concatenated text on stop. No
- * partials are shown in the editor (cosmetic-only), so quality is good
- * and the editor never shows revisable text.
+ * Press alt+m to start or stop, and alt+n to cancel. Audio is recorded to a
+ * private temporary WAV, transcribed locally, then inserted at the current
+ * text target.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, isKeyRelease, isKeyRepeat } from "@earendil-works/pi-tui";
-import { spawn, type ChildProcessByStdio } from "node:child_process";
+import { spawn } from "node:child_process";
 import { appendFileSync, createWriteStream } from "node:fs";
 import { access, chmod, mkdtemp, open, rm } from "node:fs/promises";
 import { availableParallelism, homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { Transform, type Readable } from "node:stream";
+import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
 type Backend = "local" | "litellm";
@@ -55,7 +30,6 @@ export interface DictateConfig {
   litellmApiKey?: string;
   litellmModel: string;
   debug: boolean;
-  deepgramApiKey?: string;
 }
 
 const positiveInteger = (name: string, value: string | undefined, fallback: number): number => {
@@ -78,7 +52,6 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): DictateConfig 
     PI_DICTATE_LITELLM_API_KEY,
     PI_DICTATE_LITELLM_MODEL,
     DICTATE_DEBUG,
-    DEEPGRAM_API_KEY,
   } = env;
 
   const backend = PI_DICTATE_BACKEND ?? "local";
@@ -105,7 +78,6 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): DictateConfig 
     litellmApiKey: PI_DICTATE_LITELLM_API_KEY,
     litellmModel: PI_DICTATE_LITELLM_MODEL ?? "whisper-1",
     debug: !!DICTATE_DEBUG,
-    deepgramApiKey: DEEPGRAM_API_KEY,
   };
 }
 
@@ -206,6 +178,7 @@ export interface Recording {
 
 export interface AudioRecorder {
   path: string;
+  failure: Promise<Error | null>;
   stop(): Promise<Recording>;
   discard(): Promise<void>;
 }
@@ -248,6 +221,15 @@ export async function recordAudio(
   const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
     child.once("close", (code, signal) => resolve({ code, signal }));
   });
+  let stopping = false;
+  let reportFailure!: (error: Error | null) => void;
+  const failure = new Promise<Error | null>((resolve) => (reportFailure = resolve));
+  void closed.then((exit) => {
+    reportFailure(stopping ? null : new Error(`arecord exited unexpectedly (code ${exit.code})`));
+  });
+  void writing.catch((error) => {
+    if (!stopping) reportFailure(error instanceof Error ? error : new Error(String(error)));
+  });
 
   try {
     await new Promise<void>((resolve, reject) => {
@@ -269,6 +251,7 @@ export async function recordAudio(
   const stop = () => {
     if (stopPromise) return stopPromise;
     stopPromise = (async () => {
+      stopping = true;
       child.kill("SIGTERM");
       const [exit] = await Promise.all([closed, writing]);
       if (exit.code !== 0 && exit.signal !== "SIGTERM") {
@@ -290,9 +273,11 @@ export async function recordAudio(
 
   return {
     path,
+    failure,
     stop,
     discard() {
       if (discardPromise) return discardPromise;
+      stopping = true;
       discardPromise = (async () => {
         if (stopPromise) await stopPromise.catch(() => {});
         else {
@@ -313,26 +298,7 @@ export function appendText(current: string, addition: string): string {
   return current + (current && !/\s$/.test(current) ? " " : "") + text;
 }
 
-// Deepgram streaming endpoint. Tuning notes:
-//   model=nova-3        — flagship, sub-300ms latency, best accuracy
-//   encoding=linear16   — raw 16-bit PCM (what sox/rec gives us with -e signed-integer -b 16)
-//   sample_rate=16000   — 16kHz mono is the standard low-bandwidth STT format
-//   interim_results=false — we only want finals, never partials
-//   smart_format=true   — formats numbers, dates, currencies nicely
-//   punctuate=true      — adds commas/periods/question marks
-//   endpointing=300     — 300ms of silence ends an utterance (faster finals)
-const DG_URL =
-  "wss://api.deepgram.com/v1/listen" +
-  "?model=nova-3" +
-  "&encoding=linear16" +
-  "&sample_rate=16000" +
-  "&channels=1" +
-  "&interim_results=false" +
-  "&smart_format=true" +
-  "&punctuate=true" +
-  "&endpointing=300";
-
-type State = "idle" | "recording" | "stopping";
+type State = "idle" | "recording" | "transcribing";
 
 // ── Focus-aware delivery ──────────────────────────────────────────────────
 // The TUI handle is captured once via a zero-height widget factory (the only
@@ -393,7 +359,14 @@ function rmsToBlock(rms: number): string {
   return PEAK_BLOCKS[idx]!;
 }
 
-export default function (pi: ExtensionAPI) {
+export interface DictateDependencies {
+  recordAudio: typeof recordAudio;
+  transcribeLocal: typeof transcribeLocal;
+}
+
+export default function (pi: ExtensionAPI, dependencies: Partial<DictateDependencies> = {}) {
+  const startRecorder = dependencies.recordAudio ?? recordAudio;
+  const transcribe = dependencies.transcribeLocal ?? transcribeLocal;
   let config: DictateConfig | null = null;
   let configError: string | null = null;
   try {
@@ -402,8 +375,6 @@ export default function (pi: ExtensionAPI) {
     configError = error instanceof Error ? error.message : String(error);
   }
 
-  // Optional forensic logging: run pi with DICTATE_DEBUG=1 to append timestamped
-  // lifecycle events to /tmp/dictate-debug.log.
   const dbg = (msg: string) => {
     if (!config?.debug) return;
     try {
@@ -412,59 +383,43 @@ export default function (pi: ExtensionAPI) {
   };
 
   let state: State = "idle";
-  let rec: ChildProcessByStdio<null, Readable, Readable> | null = null;
-  let ws: WebSocket | null = null;
-  let finals: string[] = [];
+  let recorderPromise: Promise<AudioRecorder> | null = null;
+  let recorder: AudioRecorder | null = null;
+  let transcriptionAbort: AbortController | null = null;
+  let transcriptionPromise: Promise<string> | null = null;
+  let cleanupPromise: Promise<void> | null = null;
+  let insertAfterCleanup = false;
+  let transcript = "";
   let activeCtx: ExtensionContext | null = null;
-  let flushed = false;
-  let cancelled = false;
-  let stopTimeout: NodeJS.Timeout | null = null;
+  let generation = 0;
   let spinnerTimer: NodeJS.Timeout | null = null;
   let spinnerFrame = 0;
-  // Session generation: incremented on every start and every cleanup. All
-  // rec/ws event handlers capture the generation they belong to and no-op
-  // when it's stale — otherwise a PREVIOUS session's socket erroring/closing
-  // late (e.g. one we aborted mid-handshake) would run cleanup() and tear
-  // down the CURRENT live session.
-  let generation = 0;
-  // Audio meter state. `meter` is a ring of recent RMS values, newest at
-  // index METER_CELLS-1. `currentLevel` is the most recent RMS observed from
-  // any audio chunk — the meter tick just samples it. Crucially we never reset
-  // it: empty ticks re-render the last observed value, so the bars never drop
-  // to silence just because no chunk happened to arrive in that 60ms window.
   let meterTimer: NodeJS.Timeout | null = null;
   let meter: number[] = new Array(METER_CELLS).fill(0);
   let currentLevel = 0;
+  let tuiHandle: any = null;
+  let removeInputListener: (() => void) | null = null;
+  let lastCtx: ExtensionContext | null = null;
+  let shuttingDown = false;
 
-  const setStatus = (msg: string | undefined) => {
-    if (!activeCtx) return;
-    activeCtx.ui.setStatus("dictate", msg);
+  const notify = (ctx: ExtensionContext | null, message: string, level: "error" | "warning") => {
+    try {
+      ctx?.ui.notify(message, level);
+    } catch {}
   };
-
+  const setStatus = (msg: string | undefined) => activeCtx?.ui.setStatus("dictate", msg);
   const stopSpinner = () => {
-    if (spinnerTimer) {
-      clearInterval(spinnerTimer);
-      spinnerTimer = null;
-    }
+    if (spinnerTimer) clearInterval(spinnerTimer);
+    spinnerTimer = null;
   };
-
   const stopMeter = () => {
-    if (meterTimer) {
-      clearInterval(meterTimer);
-      meterTimer = null;
-    }
+    if (meterTimer) clearInterval(meterTimer);
+    meterTimer = null;
   };
-
-  /** Start the meter ticking. Each tick shifts the ring and samples currentLevel. */
   const startMeter = () => {
     stopMeter();
     meter = new Array(METER_CELLS).fill(0);
     currentLevel = 0;
-    // Recording dot: a text glyph colored via the theme, not an emoji — emoji
-    // presentation renders double-width in its own baked-in color and visually
-    // shouts in the footer. `●` is the same dot pi's own docs use for
-    // indicators; theme "error" gives the red. (If you ever want strictly
-    // ASCII, swap the glyph for "O".)
     const render = () => {
       const dot = activeCtx?.ui.theme.fg("error", "●") ?? "●";
       setStatus(`${dot} ${meter.map(rmsToBlock).join("")} listening…`);
@@ -476,8 +431,6 @@ export default function (pi: ExtensionAPI) {
       render();
     }, METER_TICK_MS);
   };
-
-  /** Animate the dictate status row with a braille spinner + suffix message. */
   const startSpinner = (suffix: string) => {
     stopSpinner();
     spinnerFrame = 0;
@@ -488,99 +441,90 @@ export default function (pi: ExtensionAPI) {
     }, SPINNER_INTERVAL_MS);
   };
 
-  let tuiHandle: any = null;
-  let removeInputListener: (() => void) | null = null;
-  let lastCtx: ExtensionContext | null = null;
-
-  /** Resolve where dictated text would go RIGHT NOW, based on keyboard focus. */
   const resolveTarget = (): Target | null => {
     const focused = tuiHandle?.focusedComponent;
     if (!focused) return null;
-    // Editor-like focus: the main chat editor, custom editors, and the
-    // ctx.ui.editor()/input() popups (their inner pi-tui Editor hangs off
-    // `.editor`). These accept a guaranteed direct setText append.
     const editor = asEditorLike(focused) ?? asEditorLike(focused.editor);
     if (editor) return { kind: "editor", editor };
-    // Opaque component with input handling (quiz/ask selects, selectors):
-    // we can type into it, but whether the text lands depends on its
-    // internal focus (e.g. the quiz note field must be Tab-focused).
     if (typeof focused.handleInput === "function") return { kind: "typable", component: focused };
     return null;
   };
 
-  const flush = () => {
-    if (flushed || !activeCtx) return;
-    flushed = true;
-    if (cancelled) return; // discard transcript on cancel
-    const text = finals.join(" ").replace(/\s+/g, " ").trim();
+  const deliver = (ctx: ExtensionContext, text: string) => {
     if (!text) return;
-
-    // Legacy fallback: no TUI handle captured (non-TUI mode / older pi) —
-    // append to the main chat editor exactly as before.
-    if (!tuiHandle) {
-      const current = activeCtx.ui.getEditorText() ?? "";
-      activeCtx.ui.setEditorText(appendText(current, text));
-      return;
-    }
-
-    // Resolve the target NOW — focus may have changed while dictating.
     const target = resolveTarget();
     if (target?.kind === "editor") {
-      const current = target.editor.getText() ?? "";
-      target.editor.setText(appendText(current, text));
+      target.editor.setText(appendText(target.editor.getText() ?? "", text));
       tuiHandle.requestRender?.();
       return;
     }
     if (target?.kind === "typable") {
-      // Synthetic typing: the component routes the text wherever its
-      // internal focus is. Text is plain printable words (whitespace
-      // already normalized), so no keybindings/autocomplete can trigger.
       target.component.handleInput(text);
       tuiHandle.requestRender?.();
       return;
     }
-    // Nothing to type into: don't throw the transcript away — stash it on
-    // the clipboard and say so.
-    try {
-      const p = spawn("pbcopy", [], { stdio: ["pipe", "ignore", "ignore"] });
-      p.stdin.end(text);
-    } catch {}
-    activeCtx.ui.notify("Dictation finished but no input field is focused — transcript copied to clipboard", "warning");
+    ctx.ui.setEditorText(appendText(ctx.ui.getEditorText() ?? "", text));
+    if (tuiHandle) ctx.ui.notify("Dictation inserted into the main editor because no input field is focused", "warning");
   };
 
-  const cleanup = () => {
-    generation++; // invalidate the dying session's event handlers
-    dbg(`cleanup → gen ${generation}`);
-    flush();
+  const cleanup = (insert: boolean, expectedGeneration = generation): Promise<void> => {
+    if (cleanupPromise) {
+      if (!insert) insertAfterCleanup = false;
+      return cleanupPromise;
+    }
+    if (expectedGeneration !== generation) return Promise.resolve();
+    insertAfterCleanup = insert;
+    const pendingRecorder = recorderPromise;
+    const currentRecorder = recorder;
+    const pendingTranscription = transcriptionPromise;
+    const ctx = activeCtx;
+    const text = transcript;
+    const abort = transcriptionAbort;
+
+    generation++;
+    state = "transcribing";
+    recorderPromise = null;
+    recorder = null;
+    transcriptionAbort = null;
+    transcriptionPromise = null;
+    transcript = "";
+    activeCtx = null;
     stopSpinner();
     stopMeter();
-    if (stopTimeout) {
-      clearTimeout(stopTimeout);
-      stopTimeout = null;
-    }
-    if (rec) {
+    try {
+      ctx?.ui.setStatus("dictate", undefined);
+    } catch {}
+    abort?.abort();
+
+    const work = (async () => {
+      await pendingTranscription?.catch(() => {});
+      const staleRecorder = currentRecorder ?? (await pendingRecorder?.catch(() => null));
       try {
-        rec.kill("SIGTERM");
-      } catch {}
-      rec = null;
-    }
-    if (ws) {
-      try {
-        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-          ws.close();
+        await staleRecorder?.discard();
+      } catch (error) {
+        notify(ctx, `Could not clean up dictation: ${error instanceof Error ? error.message : String(error)}`, "error");
+        return;
+      }
+      if (insertAfterCleanup && ctx) {
+        try {
+          deliver(ctx, text);
+        } catch (error) {
+          notify(ctx, `Could not insert dictation: ${error instanceof Error ? error.message : String(error)}`, "error");
         }
-      } catch {}
-      ws = null;
-    }
-    finals = [];
-    state = "idle";
-    setStatus(undefined);
-    activeCtx = null;
-    flushed = false;
-    cancelled = false;
+      }
+    })();
+    cleanupPromise = work;
+    void work.then(() => {
+      if (cleanupPromise === work) {
+        cleanupPromise = null;
+        insertAfterCleanup = false;
+        state = "idle";
+      }
+    });
+    return work;
   };
 
-  const startDictation = (ctx: ExtensionContext) => {
+  const startDictation = async (ctx: ExtensionContext) => {
     const unsupportedPlatform = platformError();
     if (unsupportedPlatform) {
       ctx.ui.notify(unsupportedPlatform, "error");
@@ -591,207 +535,93 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const apiKey = config!.deepgramApiKey;
-    if (!apiKey) {
-      ctx.ui.notify("DEEPGRAM_API_KEY not set in environment", "error");
-      return;
-    }
-
     activeCtx = ctx;
-    finals = [];
-    flushed = false;
-    cancelled = false;
+    transcript = "";
     state = "recording";
     const myGeneration = ++generation;
     dbg(`start (gen ${myGeneration})`);
     startMeter();
-
-    // Spawn sox `rec` to capture 16kHz / 16-bit / mono PCM to stdout.
-    let proc: ChildProcessByStdio<null, Readable, Readable>;
+    const pending = startRecorder(
+      config!,
+      (level) => {
+        if (myGeneration === generation) currentLevel = level;
+      },
+    );
+    recorderPromise = pending;
     try {
-      proc = spawn(
-        "rec",
-        [
-          "-q", // quiet
-          // Shrink sox's IO buffer so stdout flushes ~every 16ms instead of
-          // the default ~256ms. 512 bytes = 256 samples = 16ms at 16kHz/16-bit
-          // mono. This is the dominant source of meter latency.
-          "--buffer", "512",
-          "-r", "16000",
-          "-c", "1",
-          "-b", "16",
-          "-e", "signed-integer",
-          "-t", "raw",
-          "-", // stdout
-        ],
-        { stdio: ["ignore", "pipe", "pipe"] },
-      );
-    } catch (e: any) {
-      ctx.ui.notify(`Failed to spawn 'rec'. Install sox: brew install sox`, "error");
-      cleanup();
-      return;
-    }
-    rec = proc;
-
-    proc.on("error", (err) => {
+      const startedRecorder = await pending;
+      if (myGeneration !== generation) {
+        await startedRecorder.discard();
+        return;
+      }
+      recorder = startedRecorder;
+      void startedRecorder.failure.then(async (error) => {
+        if (!error || myGeneration !== generation) return;
+        notify(activeCtx, error.message, "error");
+        await cleanup(false, myGeneration);
+      }).catch(() => {});
+    } catch (error) {
       if (myGeneration !== generation) return;
-      ctx.ui.notify(`rec error: ${err.message} (install sox: brew install sox)`, "error");
-      cleanup();
-    });
-
-    proc.on("exit", (code) => {
-      if (myGeneration !== generation) return; // stale recorder — a newer/ended session owns state
-      // Natural exit on SIGTERM during stopDictation is fine. Anything else
-      // mid-recording is a problem.
-      if (state === "recording" && code !== null && code !== 0) {
-        if (activeCtx) {
-          activeCtx.ui.notify(`rec exited unexpectedly (code ${code})`, "warning");
-        }
-        cleanup();
-      }
-    });
-
-    // Open Deepgram WebSocket. Auth via subprotocol (portable across Node native
-    // WebSocket and browsers): `new WebSocket(url, ["token", API_KEY])`.
-    try {
-      ws = new WebSocket(DG_URL, ["token", apiKey]);
-    } catch (e: any) {
-      ctx.ui.notify(`Deepgram WS failed: ${e.message}`, "error");
-      cleanup();
-      return;
+      notify(ctx, error instanceof Error ? error.message : String(error), "error");
+      await cleanup(false, myGeneration);
     }
-
-    ws.addEventListener("open", () => {
-      if (myGeneration !== generation) {
-        dbg(`ws open (stale gen ${myGeneration}, current ${generation}) — ignored`);
-        return;
-      }
-      dbg(`ws open (gen ${myGeneration})`);
-      if (!rec || !ws) return;
-      rec.stdout.on("data", (chunk: Buffer) => {
-        // Track loudness for the meter (just the latest chunk's RMS — the meter
-        // tick samples this), then forward to Deepgram.
-        currentLevel = rmsFromPcm16(chunk);
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(chunk);
-        }
-      });
-    });
-
-    ws.addEventListener("message", (ev) => {
-      if (myGeneration !== generation) return;
-      try {
-        const msg = JSON.parse(ev.data as string);
-        if (msg.type === "Results" && msg.is_final) {
-          const t = msg.channel?.alternatives?.[0]?.transcript;
-          if (t) finals.push(t);
-        }
-        // We could also handle msg.type === "Metadata" (sent after CloseStream
-        // finishes draining), but ws.close handles the same flush path.
-      } catch {
-        // ignore non-JSON frames
-      }
-    });
-
-    ws.addEventListener("error", () => {
-      if (myGeneration !== generation) {
-        dbg(`ws error (stale gen ${myGeneration}, current ${generation}) — ignored`);
-        return;
-      }
-      dbg(`ws error (gen ${myGeneration})`);
-      if (activeCtx) activeCtx.ui.notify("Deepgram WebSocket error", "error");
-      cleanup();
-    });
-
-    ws.addEventListener("close", (ev) => {
-      if (myGeneration !== generation) {
-        dbg(`ws close (stale gen ${myGeneration}, current ${generation}, code ${ev.code}) — ignored`);
-        return;
-      }
-      dbg(`ws close (gen ${myGeneration}, code ${ev.code})`);
-      // Server-initiated close (or our own close in cleanup): finalize.
-      if (state === "recording" || state === "stopping") {
-        cleanup();
-      }
-    });
   };
 
-  /** Stop dictation, finalize transcript, append to editor. */
-  const stopDictation = () => {
-    if (state !== "recording") return;
-    state = "stopping";
+  const stopDictation = async () => {
+    if (state !== "recording" || !recorderPromise || !config) return;
+    state = "transcribing";
     stopMeter();
-    startSpinner("finalizing…");
-
-    // Stop the mic first so no more audio enqueues.
-    if (rec) {
-      try {
-        rec.kill("SIGTERM");
-      } catch {}
-    }
-
-    // Tell Deepgram we're done; it will flush remaining finals then close.
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      try {
-        ws.send(JSON.stringify({ type: "CloseStream" }));
-      } catch {
-        cleanup();
-        return;
-      }
-      // Safety net: if Deepgram never closes the socket, force cleanup after 3s.
-      stopTimeout = setTimeout(() => {
-        if (state === "stopping") cleanup();
-      }, 3000);
-    } else {
-      cleanup();
+    startSpinner("transcribing…");
+    const myGeneration = generation;
+    try {
+      const currentRecorder = recorder ?? (await recorderPromise);
+      if (myGeneration !== generation) return;
+      recorder = currentRecorder;
+      const recording = await currentRecorder.stop();
+      if (myGeneration !== generation) return;
+      const abort = new AbortController();
+      transcriptionAbort = abort;
+      const pendingTranscription = transcribe(recording.path, recording.duration, config, abort.signal);
+      transcriptionPromise = pendingTranscription;
+      const result = await pendingTranscription;
+      if (myGeneration !== generation) return;
+      transcript = result;
+      await cleanup(true, myGeneration);
+    } catch (error) {
+      if (myGeneration !== generation) return;
+      notify(activeCtx, error instanceof Error ? error.message : String(error), "error");
+      await cleanup(false, myGeneration);
     }
   };
 
-  /** Cancel dictation: discard any collected transcript and tear everything down immediately. */
-  const cancelDictation = () => {
-    if (state !== "recording" && state !== "stopping") return;
-    cancelled = true;
-    finals = [];
-    // No need to wait for Deepgram to flush — we're throwing the result away.
-    cleanup();
+  const cancelDictation = async () => {
+    if (state === "recording" || state === "transcribing") await cleanup(false);
   };
 
-  /** Toggle dictation, gated on there being somewhere for the text to go. */
-  const toggleDictation = (ctx: ExtensionContext) => {
+  const toggleDictation = async (ctx: ExtensionContext) => {
+    if (shuttingDown) return;
     lastCtx = ctx;
     if (state === "idle") {
       if (tuiHandle && !resolveTarget()) {
         ctx.ui.notify("No input field is focused — dictation not started", "warning");
         return;
       }
-      startDictation(ctx);
+      await startDictation(ctx);
     } else if (state === "recording") {
-      stopDictation();
+      await stopDictation();
     }
-    // Ignore presses during the "stopping" state — Deepgram is finalizing.
   };
 
-  // Global input listener: catches alt+m/alt+n before ANY focused component,
-  // which is what makes dictation work inside dialogs. Registered once the
-  // TUI handle is captured (see session_start below).
   const onGlobalInput = (data: string) => {
-    // Kitty flag-2 terminals send press + REPEAT + RELEASE events, and input
-    // listeners run BEFORE the TUI's release filter (that filter only guards
-    // dispatch to the focused component). matchesKey also ignores the Kitty
-    // event type. Without this guard a single physical alt+m press toggles
-    // TWICE: press starts dictation, release instantly stops it and closes
-    // the WebSocket mid-handshake — which then surfaces as
-    // "Deepgram WebSocket error" (and its stale error event can kill the NEXT
-    // session). Filter to press events only.
-    if (isKeyRelease(data) || isKeyRepeat(data)) return undefined;
+    if (shuttingDown || isKeyRelease(data) || isKeyRepeat(data)) return undefined;
     if (matchesKey(data, Key.alt("m"))) {
-      dbg(`alt+m (data=${JSON.stringify(data)}) state=${state}`);
-      if (lastCtx) toggleDictation(lastCtx);
+      dbg(`alt+m state=${state}`);
+      if (lastCtx) void toggleDictation(lastCtx);
       return { consume: true };
     }
     if (matchesKey(data, Key.alt("n"))) {
-      dbg(`alt+n (data=${JSON.stringify(data)}) state=${state}`);
-      cancelDictation();
+      dbg(`alt+n state=${state}`);
+      void cancelDictation();
       return { consume: true };
     }
     return undefined;
@@ -800,9 +630,6 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     lastCtx = ctx;
     if (ctx.mode !== "tui" || tuiHandle) return;
-    // Capture the TUI handle via an invisible zero-height widget. The
-    // listener function reference is stable, so even if the factory re-runs
-    // the TUI's listener Set de-dupes it.
     ctx.ui.setWidget("dictate-tui-handle", (tui: any) => {
       tuiHandle = tui;
       removeInputListener = tui.addInputListener(onGlobalInput);
@@ -810,29 +637,21 @@ export default function (pi: ExtensionAPI) {
     });
   });
 
-  // Shortcut registrations kept as a fallback for contexts where the TUI
-  // handle was never captured (non-TUI modes, older pi): they only fire when
-  // the main editor is focused, but that's precisely the legacy path. When
-  // the listener IS installed it consumes the key first, so no double-fire.
   pi.registerShortcut(Key.alt("m"), {
-    description: "Toggle voice dictation (Deepgram)",
-    handler: async (ctx) => {
-      toggleDictation(ctx);
-    },
+    description: "Toggle local voice dictation",
+    handler: toggleDictation,
   });
 
-  // Dedicated cancel binding. Dictation-only — a no-op when no dictation is
-  // in flight, so it's safe to hammer without affecting anything else.
   pi.registerShortcut(Key.alt("n"), {
     description: "Cancel voice dictation (discard transcript)",
-    handler: async () => {
-      cancelDictation();
-    },
+    handler: cancelDictation,
   });
 
-  pi.on("session_shutdown", () => {
-    if (state !== "idle") cleanup();
+  pi.on("session_shutdown", async () => {
+    shuttingDown = true;
     removeInputListener?.();
     removeInputListener = null;
+    if (state !== "idle") await cleanup(false);
+    else await cleanupPromise;
   });
 }
