@@ -111,6 +111,29 @@ export function platformError(platform: NodeJS.Platform = process.platform): str
   return platform === "linux" ? null : `pi-dictate supports Linux only; current platform is ${platform}`;
 }
 
+/** Build a 44-byte WAV header for finished 16 kHz mono S16_LE PCM. */
+export function wavHeader(pcmBytes: number): Buffer {
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + pcmBytes, 4);
+  header.write("WAVEfmt ", 8);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(1, 22);
+  header.writeUInt32LE(16_000, 24);
+  header.writeUInt32LE(32_000, 28);
+  header.writeUInt16LE(2, 32);
+  header.writeUInt16LE(16, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(pcmBytes, 40);
+  return header;
+}
+
+/** Size whisper.cpp's audio context to the recording unless explicitly overridden. */
+export function audioContext(seconds: number, override?: number): number {
+  return override ?? Math.max(256, Math.min(1500, Math.ceil((seconds / 30) * 1500) + 150));
+}
+
 // Deepgram streaming endpoint. Tuning notes:
 //   model=nova-3        — flagship, sub-300ms latency, best accuracy
 //   encoding=linear16   — raw 16-bit PCM (what sox/rec gives us with -e signed-integer -b 16)
