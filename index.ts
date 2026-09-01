@@ -9,7 +9,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, isKeyRelease, isKeyRepeat } from "@earendil-works/pi-tui";
 import { spawn } from "node:child_process";
-import { appendFileSync, createWriteStream } from "node:fs";
+import { appendFileSync, createWriteStream, openAsBlob } from "node:fs";
 import { access, chmod, mkdtemp, open, rm } from "node:fs/promises";
 import { availableParallelism, homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -169,6 +169,38 @@ export async function transcribeLocal(
       else reject(new Error(`whisper-cli exited with code ${code}: ${stderr.trim().slice(0, 500)}`));
     });
   });
+}
+
+/** Post a completed WAV recording to an OpenAI-compatible transcription endpoint. */
+export async function transcribeLiteLLM(
+  wavPath: string,
+  config: DictateConfig,
+  signal?: AbortSignal,
+): Promise<string> {
+  const endpoint = new URL(config.litellmUrl!);
+  const hostname = endpoint.hostname.replace(/^\[|\]$/g, "");
+  const loopback = hostname === "localhost" || hostname === "::1" || /^127\./.test(hostname);
+  if (endpoint.protocol === "http:" && !loopback) {
+    throw new Error("LiteLLM refuses plaintext HTTP to a non-loopback host");
+  }
+
+  const form = new FormData();
+  form.append("file", await openAsBlob(wavPath, { type: "audio/wav" }), "recording.wav");
+  form.append("model", config.litellmModel);
+  form.append("language", config.language);
+  form.append("response_format", "json");
+  const headers = config.litellmApiKey
+    ? { Authorization: `Bearer ${config.litellmApiKey}` }
+    : undefined;
+  const response = await fetch(endpoint, { method: "POST", headers, body: form, signal });
+  if (!response.ok) {
+    throw new Error(`LiteLLM returned ${response.status}: ${(await response.text()).trim().slice(0, 500)}`);
+  }
+  const result: unknown = await response.json();
+  if (!result || typeof result !== "object" || typeof (result as { text?: unknown }).text !== "string") {
+    throw new Error("LiteLLM returned invalid JSON: expected a text field");
+  }
+  return (result as { text: string }).text;
 }
 
 export interface Recording {
@@ -360,11 +392,13 @@ function rmsToBlock(rms: number): string {
 export interface DictateDependencies {
   recordAudio: typeof recordAudio;
   transcribeLocal: typeof transcribeLocal;
+  transcribeLiteLLM: typeof transcribeLiteLLM;
 }
 
 export default function (pi: ExtensionAPI, dependencies: Partial<DictateDependencies> = {}) {
   const startRecorder = dependencies.recordAudio ?? recordAudio;
-  const transcribe = dependencies.transcribeLocal ?? transcribeLocal;
+  const transcribeLocally = dependencies.transcribeLocal ?? transcribeLocal;
+  const transcribeRemotely = dependencies.transcribeLiteLLM ?? transcribeLiteLLM;
   let config: DictateConfig | null = null;
   let configError: string | null = null;
   try {
@@ -579,7 +613,9 @@ export default function (pi: ExtensionAPI, dependencies: Partial<DictateDependen
       if (myGeneration !== generation) return;
       const abort = new AbortController();
       transcriptionAbort = abort;
-      const pendingTranscription = transcribe(recording.path, recording.duration, config, abort.signal);
+      const pendingTranscription = config.backend === "local"
+        ? transcribeLocally(recording.path, recording.duration, config, abort.signal)
+        : transcribeRemotely(recording.path, config, abort.signal);
       transcriptionPromise = pendingTranscription;
       const result = await pendingTranscription;
       if (myGeneration !== generation) return;

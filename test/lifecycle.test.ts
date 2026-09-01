@@ -23,7 +23,7 @@ function fakeRecorder(name = "recording.wav", discard = async () => {}) {
   return { recorder, fail, get discardCount() { return discardCount; } };
 }
 
-async function harness(dependencies: Partial<DictateDependencies>) {
+async function harness(dependencies: Partial<DictateDependencies>, env: NodeJS.ProcessEnv = {}) {
   const events = new Map<string, (...args: any[]) => any>();
   const shortcuts: Array<{ handler: (...args: any[]) => any }> = [];
   const notifications: Array<{ message: string; level: string }> = [];
@@ -58,7 +58,16 @@ async function harness(dependencies: Partial<DictateDependencies>) {
     registerShortcut: (_key: unknown, shortcut: { handler: (...args: any[]) => any }) => shortcuts.push(shortcut),
   };
 
-  dictate(pi as any, dependencies);
+  const previousEnv = new Map(Object.keys(env).map((key) => [key, process.env[key]]));
+  Object.assign(process.env, env);
+  try {
+    dictate(pi as any, dependencies);
+  } finally {
+    for (const [key, value] of previousEnv) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
   await events.get("session_start")?.({}, ctx);
   return {
     ctx,
@@ -91,11 +100,13 @@ test("local lifecycle records, transcribes, inserts, and cleans up", async () =>
   assert.equal(app.statuses.at(-1), undefined);
 });
 
-test("a transcription error inserts nothing and cleans up", async () => {
+test("a local transcription error inserts nothing and never falls back remotely", async () => {
   const fake = fakeRecorder();
+  let remoteCalls = 0;
   const app = await harness({
     recordAudio: async () => fake.recorder,
     transcribeLocal: async () => { throw new Error("transcription failed"); },
+    transcribeLiteLLM: async () => { remoteCalls++; return "remote fallback"; },
   });
 
   await app.toggle();
@@ -103,7 +114,29 @@ test("a transcription error inserts nothing and cleans up", async () => {
 
   assert.equal(app.editor.text, "Existing");
   assert.equal(fake.discardCount, 1);
+  assert.equal(remoteCalls, 0);
   assert.deepEqual(app.notifications.at(-1), { message: "transcription failed", level: "error" });
+});
+
+test("LiteLLM transcription is selected only by explicit configuration", async () => {
+  const fake = fakeRecorder();
+  let localCalls = 0;
+  let remoteCalls = 0;
+  const app = await harness({
+    recordAudio: async () => fake.recorder,
+    transcribeLocal: async () => { localCalls++; return "local"; },
+    transcribeLiteLLM: async () => { remoteCalls++; return "remote"; },
+  }, {
+    PI_DICTATE_BACKEND: "litellm",
+    PI_DICTATE_LITELLM_URL: "https://llm.example/v1/audio/transcriptions",
+  });
+
+  await app.toggle();
+  await app.toggle();
+
+  assert.equal(app.editor.text, "Existing remote");
+  assert.equal(localCalls, 0);
+  assert.equal(remoteCalls, 1);
 });
 
 test("cancel waits for the transcriber to terminate before deleting its WAV", async () => {
