@@ -116,6 +116,21 @@ test("transcribeLiteLLM honours AbortSignal", async (t) => {
   server.closeAllConnections();
 });
 
+test("transcribeLiteLLM refuses redirects so HTTPS cannot downgrade to plaintext", async (t) => {
+  const wavPath = await fixture(t);
+  const { url } = await listen(t, async (request, response) => {
+    for await (const _chunk of request) {}
+    if (request.url === "/redirect") {
+      response.writeHead(307, { location: "/target" });
+      response.end();
+    } else {
+      response.end(JSON.stringify({ text: "redirected" }));
+    }
+  });
+
+  await assert.rejects(transcribeLiteLLM(wavPath, configFor(new URL("/redirect", url).href)));
+});
+
 test("transcribeLiteLLM refuses plaintext HTTP to a non-loopback host", async () => {
   await assert.rejects(
     transcribeLiteLLM("/unused.wav", configFor("http://example.com/v1/audio/transcriptions")),

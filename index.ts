@@ -192,7 +192,7 @@ export async function transcribeLiteLLM(
   const headers = config.litellmApiKey
     ? { Authorization: `Bearer ${config.litellmApiKey}` }
     : undefined;
-  const response = await fetch(endpoint, { method: "POST", headers, body: form, signal });
+  const response = await fetch(endpoint, { method: "POST", headers, body: form, signal, redirect: "error" });
   if (!response.ok) {
     throw new Error(`LiteLLM returned ${response.status}: ${(await response.text()).trim().slice(0, 500)}`);
   }
