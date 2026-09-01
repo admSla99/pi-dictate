@@ -108,7 +108,7 @@ const METER_FLOOR_DB = -50;
 const METER_CEILING_DB = -10;
 
 /** Compute normalized RMS (0..1) over a buffer of signed 16-bit little-endian PCM samples. */
-function rmsFromPcm16(buf: Buffer): number {
+export function rmsFromPcm16(buf: Buffer): number {
   const sampleCount = Math.floor(buf.length / 2);
   if (sampleCount === 0) return 0;
   let sumSquares = 0;
