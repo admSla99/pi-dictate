@@ -16,7 +16,7 @@ import { join } from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
-type Backend = "local" | "litellm";
+type Backend = "local" | "litellm" | "deepgram";
 
 export interface DictateConfig {
   backend: Backend;
@@ -29,8 +29,11 @@ export interface DictateConfig {
   litellmUrl?: string;
   litellmApiKey?: string;
   litellmModel: string;
+  deepgramApiKey?: string;
   debug: boolean;
 }
+
+const DEEPGRAM_LISTEN_URL = "wss://api.deepgram.com/v1/listen";
 
 const positiveInteger = (name: string, value: string | undefined, fallback: number): number => {
   const parsed = value === undefined ? fallback : Number(value);
@@ -51,21 +54,32 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): DictateConfig 
     PI_DICTATE_LITELLM_URL,
     PI_DICTATE_LITELLM_API_KEY,
     PI_DICTATE_LITELLM_MODEL,
+    DEEPGRAM_API_KEY,
     DICTATE_DEBUG,
   } = env;
 
   const backend = PI_DICTATE_BACKEND ?? "local";
-  if (backend !== "local" && backend !== "litellm") {
-    throw new Error("PI_DICTATE_BACKEND must be 'local' or 'litellm'");
+  if (backend !== "local" && backend !== "litellm" && backend !== "deepgram") {
+    throw new Error("PI_DICTATE_BACKEND must be 'local', 'litellm', or 'deepgram'");
   }
   if (backend === "litellm" && !PI_DICTATE_LITELLM_URL) {
     throw new Error("PI_DICTATE_LITELLM_URL is required when PI_DICTATE_BACKEND=litellm");
+  }
+  const deepgramApiKey = DEEPGRAM_API_KEY?.trim() || undefined;
+  if (backend === "deepgram" && !deepgramApiKey) {
+    throw new Error("DEEPGRAM_API_KEY is required when PI_DICTATE_BACKEND=deepgram");
+  }
+  const language = PI_DICTATE_LANGUAGE ?? "auto";
+  if (backend === "deepgram" && language === "auto") {
+    throw new Error(
+      "PI_DICTATE_LANGUAGE must be set explicitly (for example PI_DICTATE_LANGUAGE=sk) when PI_DICTATE_BACKEND=deepgram; 'auto' is not supported for streaming transcription",
+    );
   }
 
   return {
     backend,
     audioDevice: PI_DICTATE_AUDIO_DEVICE ?? "default",
-    language: PI_DICTATE_LANGUAGE ?? "auto",
+    language,
     threads: positiveInteger("PI_DICTATE_THREADS", PI_DICTATE_THREADS, Math.min(availableParallelism(), 8)),
     whisperBin: PI_DICTATE_WHISPER_BIN ?? "whisper-cli",
     modelPath:
@@ -77,12 +91,257 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): DictateConfig 
     litellmUrl: PI_DICTATE_LITELLM_URL,
     litellmApiKey: PI_DICTATE_LITELLM_API_KEY,
     litellmModel: PI_DICTATE_LITELLM_MODEL ?? "whisper-1",
+    deepgramApiKey,
     debug: !!DICTATE_DEBUG,
   };
 }
 
+/** Build the Deepgram live-transcription URL; credentials are never included here. */
+export function deepgramListenUrl(config: DictateConfig): string {
+  const params = new URLSearchParams({
+    model: "nova-3",
+    language: config.language,
+    encoding: "linear16",
+    sample_rate: "16000",
+    channels: "1",
+    interim_results: "false",
+    smart_format: "true",
+    punctuate: "true",
+    endpointing: "300",
+  });
+  return `${DEEPGRAM_LISTEN_URL}?${params.toString()}`;
+}
+
 export function platformError(platform: NodeJS.Platform = process.platform): string | null {
   return platform === "linux" ? null : `pi-dictate supports Linux only; current platform is ${platform}`;
+}
+
+export interface DeepgramSession {
+  ready: Promise<void>;
+  sendAudio(chunk: Buffer): void;
+  finish(): Promise<string>;
+  abort(): Promise<void>;
+}
+
+type DeepgramWebSocketFactory = (url: string, protocols: string[]) => WebSocket;
+
+export interface DeepgramSessionOptions {
+  webSocketFactory?: DeepgramWebSocketFactory;
+  finishTimeoutMs?: number;
+  setTimeout?: (callback: () => void, ms: number) => unknown;
+  clearTimeout?: (handle: unknown) => void;
+}
+
+const DEEPGRAM_FINISH_TIMEOUT_MS = 3000;
+
+/** Build a sanitized connection error; never includes the API key or raw socket details. */
+function deepgramError(reason: string): Error {
+  return new Error(`Deepgram connection ${reason}`);
+}
+
+/** Extract a non-empty transcript from a final Deepgram `Results` message, ignoring anything else. */
+function finalTranscript(data: unknown): string | undefined {
+  if (typeof data !== "string") return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(data);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object") return undefined;
+  const message = parsed as {
+    type?: unknown;
+    is_final?: unknown;
+    channel?: { alternatives?: Array<{ transcript?: unknown }> };
+  };
+  if (message.type !== "Results" || message.is_final !== true) return undefined;
+  const transcript = message.channel?.alternatives?.[0]?.transcript;
+  return typeof transcript === "string" && transcript.trim().length > 0 ? transcript : undefined;
+}
+
+type DeepgramFinishResult = { ok: true; value: string } | { ok: false; error: Error };
+
+/**
+ * Open a native-WebSocket streaming session against Deepgram's live-transcription
+ * endpoint. Returns immediately; `ready` resolves once the socket has opened.
+ * Credentials travel only through the `token` subprotocol and never appear in
+ * the URL, in sent frames, or in any error this session produces.
+ */
+export function createDeepgramSession(config: DictateConfig, options: DeepgramSessionOptions = {}): DeepgramSession {
+  const factory = options.webSocketFactory ?? ((url, protocols) => new WebSocket(url, protocols));
+  const finishTimeoutMs = options.finishTimeoutMs ?? DEEPGRAM_FINISH_TIMEOUT_MS;
+  const scheduleTimeout =
+    options.setTimeout ??
+    ((callback: () => void, ms: number) => {
+      const timer = setTimeout(callback, ms);
+      timer.unref?.();
+      return timer;
+    });
+  const cancelTimeout = options.clearTimeout ?? ((handle: unknown) => clearTimeout(handle as NodeJS.Timeout));
+  const socket = factory(deepgramListenUrl(config), ["token", config.deepgramApiKey ?? ""]);
+
+  const transcripts: string[] = [];
+  let opened = false;
+
+  let readyResolve!: () => void;
+  let readyReject!: (error: Error) => void;
+  const ready = new Promise<void>((resolve, reject) => {
+    readyResolve = resolve;
+    readyReject = reject;
+  });
+  ready.catch(() => {});
+
+  let settleFinish: ((value: string) => void) | undefined;
+  let rejectFinish: ((error: Error) => void) | undefined;
+  let finishPromise: Promise<string> | undefined;
+  let abortPromise: Promise<void> | undefined;
+  let finishTimer: unknown;
+  let cleanedUp = false;
+  // The socket can terminate (close/error) before finish() is ever called; remember
+  // that single outcome so a later finish() settles immediately instead of resending
+  // CloseStream and timing out against a socket that is already gone.
+  let terminalResult: DeepgramFinishResult | undefined;
+
+  const clearFinishTimer = () => {
+    if (finishTimer !== undefined) {
+      cancelTimeout(finishTimer);
+      finishTimer = undefined;
+    }
+  };
+
+  const cleanup = () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    clearFinishTimer();
+  };
+
+  const closeBestEffort = () => {
+    try {
+      socket.close();
+    } catch {
+      // ignore: socket may already be closing or closed
+    }
+  };
+
+  // A memoized finishPromise may sit unawaited for a while (e.g. it is handed
+  // back immediately from a stored terminal result, or rejects synchronously
+  // inside its executor). Attach a no-op handler the instant it is created so
+  // a delayed `await` from the caller can never surface as an unhandled
+  // rejection; the original promise returned to callers is unaffected.
+  const suppressUnhandledRejection = (promise: Promise<unknown>): void => {
+    promise.catch(() => {});
+  };
+
+  const settleFinishOnce = (result: DeepgramFinishResult) => {
+    if (!settleFinish && !rejectFinish) return;
+    const resolve = settleFinish;
+    const reject = rejectFinish;
+    settleFinish = undefined;
+    rejectFinish = undefined;
+    clearFinishTimer();
+    if (result.ok) resolve?.(result.value);
+    else reject?.(result.error);
+  };
+
+  /** Record the socket's single terminal outcome; later finish() calls reuse it. */
+  const recordTerminal = (result: DeepgramFinishResult) => {
+    if (terminalResult) return;
+    terminalResult = result;
+    settleFinishOnce(result);
+  };
+
+  socket.addEventListener("open", () => {
+    opened = true;
+    readyResolve();
+  });
+
+  socket.addEventListener("message", (event) => {
+    const transcript = finalTranscript((event as MessageEvent).data);
+    if (transcript) transcripts.push(transcript);
+  });
+
+  socket.addEventListener("error", () => {
+    const error = deepgramError("failed");
+    if (!opened) readyReject(error);
+    recordTerminal({ ok: false, error });
+    cleanup();
+    closeBestEffort();
+  });
+
+  socket.addEventListener("close", (event) => {
+    const code = (event as CloseEvent).code;
+    if (!opened) readyReject(deepgramError("closed before it was ready"));
+    if (code === 1000) {
+      recordTerminal({ ok: true, value: transcripts.join(" ").replace(/\s+/g, " ").trim() });
+    } else {
+      recordTerminal({ ok: false, error: deepgramError(`closed unexpectedly (code ${code})`) });
+    }
+    cleanup();
+  });
+
+  const sendAudio = (chunk: Buffer): void => {
+    // Once a terminal outcome is known, throw it directly instead of touching
+    // an already-closed socket again; native WebSocket.send() would otherwise
+    // silently drop bytes while CLOSING/CLOSED, hiding the failure forever.
+    if (terminalResult) {
+      throw terminalResult.ok ? deepgramError("closed; cannot send more audio") : terminalResult.error;
+    }
+    try {
+      socket.send(chunk);
+    } catch {
+      const error = deepgramError("failed to send audio");
+      recordTerminal({ ok: false, error });
+      cleanup();
+      closeBestEffort();
+      throw error;
+    }
+  };
+
+  const finish = (): Promise<string> => {
+    if (finishPromise) return finishPromise;
+    if (terminalResult) {
+      finishPromise = terminalResult.ok ? Promise.resolve(terminalResult.value) : Promise.reject(terminalResult.error);
+      suppressUnhandledRejection(finishPromise);
+      return finishPromise;
+    }
+    finishPromise = new Promise<string>((resolve, reject) => {
+      settleFinish = resolve;
+      rejectFinish = reject;
+      try {
+        socket.send(JSON.stringify({ type: "CloseStream" }));
+      } catch {
+        // Distinguish a still-connecting socket (an actionable caller mistake:
+        // finish() must be called only after `ready` resolves) from a send
+        // failure on an otherwise-open socket.
+        const error = opened
+          ? deepgramError("failed to send CloseStream")
+          : deepgramError("cannot send CloseStream before the socket is open; call finish() only after ready resolves");
+        recordTerminal({ ok: false, error });
+        cleanup();
+        closeBestEffort();
+        return;
+      }
+      finishTimer = scheduleTimeout(() => {
+        recordTerminal({ ok: false, error: deepgramError("timed out waiting for finalization") });
+        closeBestEffort();
+      }, finishTimeoutMs);
+    });
+    suppressUnhandledRejection(finishPromise);
+    return finishPromise;
+  };
+
+  const abort = async (): Promise<void> => {
+    if (abortPromise) return abortPromise;
+    abortPromise = (async () => {
+      recordTerminal({ ok: false, error: deepgramError("aborted") });
+      if (!opened) readyReject(deepgramError("cancelled while connecting"));
+      cleanup();
+      closeBestEffort();
+    })();
+    return abortPromise;
+  };
+
+  return { ready, sendAudio, finish, abort };
 }
 
 /** Build a 44-byte WAV header for finished 16 kHz mono S16_LE PCM. */
@@ -221,12 +480,18 @@ export interface AudioRecorder {
   discard(): Promise<void>;
 }
 
+export interface RecordAudioOptions {
+  /** Called with a normalized RMS level (0..1) for each PCM chunk, for the status meter. */
+  onLevel?: (rms: number) => void;
+  /** Called once per PCM chunk with the exact raw bytes also written to the WAV payload. */
+  onAudio?: (chunk: Buffer) => void;
+  /** Override the `arecord` binary; primarily for tests. */
+  arecordBin?: string;
+}
+
 /** Capture 16 kHz mono PCM with arecord into a private temporary WAV file. */
-export async function recordAudio(
-  config: DictateConfig,
-  onLevel?: (rms: number) => void,
-  arecordBin = "arecord",
-): Promise<AudioRecorder> {
+export async function recordAudio(config: DictateConfig, options: RecordAudioOptions = {}): Promise<AudioRecorder> {
+  const { onLevel, onAudio, arecordBin = "arecord" } = options;
   const directory = await mkdtemp(join(tmpdir(), "pi-dictate-"));
   await chmod(directory, 0o700);
   const path = join(directory, "recording.wav");
@@ -237,6 +502,12 @@ export async function recordAudio(
     transform(chunk: Buffer, _encoding, callback) {
       pcmBytes += chunk.length;
       onLevel?.(rmsFromPcm16(chunk));
+      try {
+        onAudio?.(chunk);
+      } catch (error) {
+        callback(error instanceof Error ? error : new Error(String(error)));
+        return;
+      }
       callback(null, chunk);
     },
   });
@@ -334,7 +605,7 @@ export function appendText(current: string, addition: string): string {
   return current + (current && !/\s$/.test(current) ? " " : "") + text;
 }
 
-type State = "idle" | "recording" | "transcribing";
+type State = "idle" | "connecting" | "recording" | "transcribing" | "finalizing";
 
 // ── Focus-aware delivery ──────────────────────────────────────────────────
 // The public terminal-input listener catches shortcuts even when a dialog has
@@ -394,12 +665,14 @@ export interface DictateDependencies {
   recordAudio: typeof recordAudio;
   transcribeLocal: typeof transcribeLocal;
   transcribeLiteLLM: typeof transcribeLiteLLM;
+  createDeepgramSession: typeof createDeepgramSession;
 }
 
 export default function (pi: ExtensionAPI, dependencies: Partial<DictateDependencies> = {}) {
   const startRecorder = dependencies.recordAudio ?? recordAudio;
   const transcribeLocally = dependencies.transcribeLocal ?? transcribeLocal;
   const transcribeRemotely = dependencies.transcribeLiteLLM ?? transcribeLiteLLM;
+  const createSession = dependencies.createDeepgramSession ?? createDeepgramSession;
   let config: DictateConfig | null = null;
   let configError: string | null = null;
   try {
@@ -418,6 +691,7 @@ export default function (pi: ExtensionAPI, dependencies: Partial<DictateDependen
   let state: State = "idle";
   let recorderPromise: Promise<AudioRecorder> | null = null;
   let recorder: AudioRecorder | null = null;
+  let deepgramSession: DeepgramSession | null = null;
   let transcriptionAbort: AbortController | null = null;
   let transcriptionPromise: Promise<string> | null = null;
   let cleanupPromise: Promise<void> | null = null;
@@ -510,6 +784,7 @@ export default function (pi: ExtensionAPI, dependencies: Partial<DictateDependen
     const pendingRecorder = recorderPromise;
     const currentRecorder = recorder;
     const pendingTranscription = transcriptionPromise;
+    const pendingSession = deepgramSession;
     const ctx = activeCtx;
     const text = transcript;
     const abort = transcriptionAbort;
@@ -518,6 +793,7 @@ export default function (pi: ExtensionAPI, dependencies: Partial<DictateDependen
     state = "transcribing";
     recorderPromise = null;
     recorder = null;
+    deepgramSession = null;
     transcriptionAbort = null;
     transcriptionPromise = null;
     transcript = "";
@@ -528,9 +804,14 @@ export default function (pi: ExtensionAPI, dependencies: Partial<DictateDependen
       ctx?.ui.setStatus("dictate", undefined);
     } catch {}
     abort?.abort();
+    // Idempotent: harmless whether the session is still connecting, mid-finalize,
+    // or already settled from a successful finish(). Invoked immediately, but
+    // its settlement is awaited inside `work` below so cancel/shutdown cannot
+    // report completion before the Deepgram socket is disposed.
+    const sessionAbort = pendingSession?.abort().catch(() => {});
 
     const work = (async () => {
-      await pendingTranscription?.catch(() => {});
+      await Promise.all([pendingTranscription?.catch(() => {}), sessionAbort]);
       const staleRecorder = currentRecorder ?? (await pendingRecorder?.catch(() => null));
       try {
         await staleRecorder?.discard();
@@ -557,29 +838,22 @@ export default function (pi: ExtensionAPI, dependencies: Partial<DictateDependen
     return work;
   };
 
-  const startDictation = async (ctx: ExtensionContext) => {
-    const unsupportedPlatform = platformError();
-    if (unsupportedPlatform) {
-      ctx.ui.notify(unsupportedPlatform, "error");
-      return;
-    }
-    if (configError) {
-      ctx.ui.notify(configError, "error");
-      return;
-    }
-
-    activeCtx = ctx;
-    transcript = "";
+  /** Start the recorder (shared by every backend) and wire its level meter, PCM forwarding, and failure reporting. */
+  const beginCapture = async (
+    ctx: ExtensionContext,
+    myGeneration: number,
+    forwardAudio?: (chunk: Buffer) => void,
+  ) => {
     state = "recording";
-    const myGeneration = ++generation;
-    dbg(`start (gen ${myGeneration})`);
     startMeter();
-    const pending = startRecorder(
-      config!,
-      (level) => {
+    const pending = startRecorder(config!, {
+      onLevel: (level) => {
         if (myGeneration === generation) currentLevel = level;
       },
-    );
+      onAudio: forwardAudio && ((chunk) => {
+        if (myGeneration === generation) forwardAudio(chunk);
+      }),
+    });
     recorderPromise = pending;
     try {
       const startedRecorder = await pending;
@@ -600,12 +874,86 @@ export default function (pi: ExtensionAPI, dependencies: Partial<DictateDependen
     }
   };
 
+  const startDictation = async (ctx: ExtensionContext) => {
+    const unsupportedPlatform = platformError();
+    if (unsupportedPlatform) {
+      ctx.ui.notify(unsupportedPlatform, "error");
+      return;
+    }
+    if (configError) {
+      ctx.ui.notify(configError, "error");
+      return;
+    }
+
+    activeCtx = ctx;
+    transcript = "";
+    const myGeneration = ++generation;
+    dbg(`start (gen ${myGeneration})`);
+
+    if (config!.backend === "deepgram") {
+      state = "connecting";
+      startSpinner("connecting to Deepgram (remote)…");
+      let session: DeepgramSession;
+      try {
+        session = createSession(config!);
+      } catch {
+        if (myGeneration !== generation) return;
+        notify(ctx, deepgramError("failed to start").message, "error");
+        await cleanup(false, myGeneration);
+        return;
+      }
+      deepgramSession = session;
+      try {
+        await session.ready;
+      } catch (error) {
+        if (myGeneration !== generation) return;
+        notify(ctx, error instanceof Error ? error.message : String(error), "error");
+        await cleanup(false, myGeneration);
+        return;
+      }
+      if (myGeneration !== generation) {
+        await session.abort();
+        return;
+      }
+      await beginCapture(ctx, myGeneration, (chunk) => session.sendAudio(chunk));
+      return;
+    }
+
+    await beginCapture(ctx, myGeneration);
+  };
+
   const stopDictation = async () => {
     if (state !== "recording" || !recorderPromise || !config) return;
-    state = "transcribing";
-    stopMeter();
-    startSpinner("transcribing…");
     const myGeneration = generation;
+    stopMeter();
+
+    if (config.backend === "deepgram") {
+      state = "finalizing";
+      startSpinner("finalizing…");
+      const session = deepgramSession;
+      try {
+        const currentRecorder = recorder ?? (await recorderPromise);
+        if (myGeneration !== generation) return;
+        recorder = currentRecorder;
+        await currentRecorder.stop();
+        if (myGeneration !== generation) return;
+        if (!session) throw new Error("Deepgram session is not available");
+        const pendingTranscription = session.finish();
+        transcriptionPromise = pendingTranscription;
+        const result = await pendingTranscription;
+        if (myGeneration !== generation) return;
+        transcript = result;
+        await cleanup(true, myGeneration);
+      } catch (error) {
+        if (myGeneration !== generation) return;
+        notify(activeCtx, error instanceof Error ? error.message : String(error), "error");
+        await cleanup(false, myGeneration);
+      }
+      return;
+    }
+
+    state = "transcribing";
+    startSpinner("transcribing…");
     try {
       const currentRecorder = recorder ?? (await recorderPromise);
       if (myGeneration !== generation) return;
@@ -630,7 +978,9 @@ export default function (pi: ExtensionAPI, dependencies: Partial<DictateDependen
   };
 
   const cancelDictation = async () => {
-    if (state === "recording" || state === "transcribing") await cleanup(false);
+    if (state === "connecting" || state === "recording" || state === "transcribing" || state === "finalizing") {
+      await cleanup(false);
+    }
   };
 
   const toggleDictation = async (ctx: ExtensionContext) => {

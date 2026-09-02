@@ -17,20 +17,23 @@ async function setupFakeArecord(fail = false) {
   return { dir, bin };
 }
 
-test("recordAudio writes metered PCM as a finalized WAV", async (t) => {
+test("recordAudio writes metered PCM as a finalized WAV and forwards raw chunks to onAudio", async (t) => {
   const fake = await setupFakeArecord();
   t.after(() => rm(fake.dir, { recursive: true, force: true }));
   let heardAudio!: () => void;
   const audio = new Promise<void>((resolve) => (heardAudio = resolve));
   let level = 0;
-  const recorder = await recordAudio(
-    config(),
-    (value) => {
+  const audioChunks: Buffer[] = [];
+  const recorder = await recordAudio(config(), {
+    onLevel: (value) => {
       level = value;
       heardAudio();
     },
-    fake.bin,
-  );
+    onAudio: (chunk) => {
+      audioChunks.push(chunk);
+    },
+    arecordBin: fake.bin,
+  });
   t.after(() => recorder.discard());
 
   await audio;
@@ -48,12 +51,16 @@ test("recordAudio writes metered PCM as a finalized WAV", async (t) => {
   assert.equal(level, 0.5);
   assert.equal((await stat(dirname(recording.path))).mode & 0o777, 0o700);
   assert.equal((await stat(recording.path)).mode & 0o777, 0o600);
+
+  // Every PCM chunk reaches onAudio exactly once, and the concatenated bytes
+  // match the WAV payload byte-for-byte.
+  assert.deepEqual(Buffer.concat(audioChunks), wav.subarray(44));
 });
 
 test("recordAudio discard kills arecord and removes its temporary directory", async (t) => {
   const fake = await setupFakeArecord();
   t.after(() => rm(fake.dir, { recursive: true, force: true }));
-  const recorder = await recordAudio(config(), undefined, fake.bin);
+  const recorder = await recordAudio(config(), { arecordBin: fake.bin });
   const directory = dirname(recorder.path);
 
   await recorder.discard();
@@ -63,7 +70,7 @@ test("recordAudio discard kills arecord and removes its temporary directory", as
 test("recordAudio exposes an unexpected arecord exit", async (t) => {
   const fake = await setupFakeArecord(true);
   t.after(() => rm(fake.dir, { recursive: true, force: true }));
-  const recorder = await recordAudio(config(), undefined, fake.bin);
+  const recorder = await recordAudio(config(), { arecordBin: fake.bin });
   t.after(() => recorder.discard());
 
   const error = await Promise.race([
@@ -81,8 +88,47 @@ test("recordAudio exposes an unexpected arecord exit", async (t) => {
 test("recordAudio names alsa-utils when arecord is missing", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-dictate-missing-arecord-"));
   try {
-    await assert.rejects(recordAudio(config(), undefined, join(dir, "missing-arecord")), /alsa-utils/);
+    await assert.rejects(recordAudio(config(), { arecordBin: join(dir, "missing-arecord") }), /alsa-utils/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("a synchronous onAudio throw becomes a reported recorder failure instead of an uncaught exception", async (t) => {
+  const fake = await setupFakeArecord();
+  t.after(() => rm(fake.dir, { recursive: true, force: true }));
+  const thrown = new Error("boom from onAudio");
+  const recorder = await recordAudio(config(), {
+    onAudio: () => {
+      throw thrown;
+    },
+    arecordBin: fake.bin,
+  });
+  t.after(() => recorder.discard());
+
+  const error = await Promise.race([
+    recorder.failure,
+    new Promise<Error>((_resolve, reject) => {
+      setTimeout(() => reject(new Error("timed out")), 500).unref();
+    }),
+  ]);
+
+  assert.equal(error, thrown);
+});
+
+test("discard after an onAudio failure kills arecord and removes the temporary directory", async (t) => {
+  const fake = await setupFakeArecord();
+  t.after(() => rm(fake.dir, { recursive: true, force: true }));
+  const recorder = await recordAudio(config(), {
+    onAudio: () => {
+      throw new Error("boom from onAudio");
+    },
+    arecordBin: fake.bin,
+  });
+  const directory = dirname(recorder.path);
+
+  await recorder.failure;
+  await recorder.discard();
+
+  await assert.rejects(access(directory), { code: "ENOENT" });
 });

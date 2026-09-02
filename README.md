@@ -1,13 +1,13 @@
 # pi-dictate
 
-Linux voice dictation for [pi](https://github.com/badlogic/pi-mono), with local multilingual inference through whisper.cpp and an optional LiteLLM backend.
+Linux voice dictation for [pi](https://github.com/badlogic/pi-mono), with local multilingual inference through whisper.cpp, and optional LiteLLM or Deepgram remote backends.
 
-This is a Linux-only fork of [amosblomqvist/pi-dictate](https://github.com/amosblomqvist/pi-dictate), focused on local whisper.cpp inference with optional LiteLLM.
+This is a Linux-only fork of [amosblomqvist/pi-dictate](https://github.com/amosblomqvist/pi-dictate), focused on local whisper.cpp inference with optional remote backends.
 
 - `alt+m`: start recording; press again to stop and transcribe
 - `alt+n`: cancel recording or transcription without inserting text
 - Audio: 16 kHz mono S16_LE through `arecord`
-- Default backend: local multilingual `openai/whisper-large-v3-turbo`, quantized to q5_0
+- Backends: `local` (default, offline, record-then-transcribe), `litellm` (remote, record-then-transcribe), `deepgram` (remote, live streaming while you speak) — selection is explicit and there is no automatic fallback between them
 - Delivery: appends to the focused editor or typable popup, falling back to pi's main editor
 
 ## Requirements
@@ -67,6 +67,8 @@ Focus is resolved when transcription finishes. In a selector or other opaque dia
 
 Local transcription runs after recording stops, automatically detects the spoken language, and makes no network request.
 
+With `PI_DICTATE_BACKEND=deepgram`, the status row shows a connecting indicator before the microphone opens, audio streams to Deepgram in real time while you speak, and only the finalized transcript is inserted after the second `alt+m`; interim (partial) results are never shown or inserted.
+
 ## Configuration
 
 Environment variables are read when the extension loads. Set them before starting pi, then use `/reload` after changes.
@@ -75,9 +77,9 @@ Environment variables are read when the extension loads. Set them before startin
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `PI_DICTATE_BACKEND` | `local` | `local` or `litellm` |
+| `PI_DICTATE_BACKEND` | `local` | `local`, `litellm`, or `deepgram` |
 | `PI_DICTATE_AUDIO_DEVICE` | ALSA `default` | Device passed to `arecord -D`; the default omits `-D` |
-| `PI_DICTATE_LANGUAGE` | `auto` | Language passed to local transcription; `auto` lets LiteLLM detect it |
+| `PI_DICTATE_LANGUAGE` | `auto` | Language for local transcription; `auto` also lets LiteLLM detect it. Must be set to an explicit code (e.g. `sk`) for the `deepgram` backend, which rejects `auto` |
 | `DICTATE_DEBUG` | unset | Write lifecycle events to `/tmp/dictate-debug.log` when set |
 
 ### Local backend
@@ -110,6 +112,24 @@ pi
 
 Plaintext HTTP is accepted only for loopback endpoints. Backend selection is explicit: a local failure does not send audio remotely.
 
+### Deepgram backend
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DEEPGRAM_API_KEY` | required | Deepgram API key, sent only through the WebSocket `token` subprotocol; never placed in the URL, logged, or included in error messages |
+| `PI_DICTATE_LANGUAGE` | must be set explicitly | e.g. `sk`; `auto` is not a Deepgram language value, so an explicit supported code must be chosen |
+
+Example:
+
+```bash
+export PI_DICTATE_BACKEND=deepgram
+export DEEPGRAM_API_KEY=dg_xxxxxxxxxxxxxxxx
+export PI_DICTATE_LANGUAGE=sk
+pi
+```
+
+This is the only backend that transmits audio off the machine while you are still speaking: raw PCM streams to Deepgram's live-transcription endpoint (`wss://api.deepgram.com/v1/listen`, model `nova-3`) in real time. Only the finalized, punctuated transcript is inserted, and only after the second `alt+m`; interim results are never delivered. Deepgram is used only when explicitly selected with `PI_DICTATE_BACKEND=deepgram` — `local` remains the default, and no backend automatically falls back to another on failure.
+
 ## Troubleshooting
 
 - **`arecord` not found:** install `alsa-utils`.
@@ -117,6 +137,8 @@ Plaintext HTTP is accepted only for loopback endpoints. Backend selection is exp
 - **`whisper-cli` or model not found:** run `scripts/install-whisper.sh` and check `PATH` plus `PI_DICTATE_MODEL_PATH`. Use `FORCE_REINSTALL=1 ./scripts/install-whisper.sh` to rebuild the CLI.
 - **Shortcuts in tmux:** the default `alt` bindings use terminal sequences that tmux forwards without extended-key configuration.
 - **Text went to the main editor:** focus a text field before transcription finishes.
+- **`DEEPGRAM_API_KEY is required...`:** set a Deepgram API key before selecting `PI_DICTATE_BACKEND=deepgram`.
+- **Deepgram rejects `PI_DICTATE_LANGUAGE=auto`:** `auto` is not a Deepgram language value; set an explicit supported code such as `sk`.
 
 ## License
 
