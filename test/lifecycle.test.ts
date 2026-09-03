@@ -588,6 +588,29 @@ test("Deepgram lifecycle connects before capturing, streams audio, finalizes, an
   assert.equal(app.statuses.at(-1), undefined);
 });
 
+test("the connecting spinner stops once Deepgram capture starts", async (t) => {
+  const fake = fakeRecorder();
+  const dg = fakeDeepgramSession();
+  const app = await harness(
+    { createDeepgramSession: () => dg.session, recordAudio: async () => fake.recorder },
+    deepgramEnv,
+  );
+  t.after(() => app.shutdown());
+
+  const starting = app.toggle();
+  await tick();
+  dg.openReady();
+  await starting;
+
+  // Both the spinner (80 ms) and the meter (60 ms) write to the same status
+  // slot, so a leaked spinner shows up as alternating frames here.
+  const from = app.statuses.length;
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  const rendered = app.statuses.slice(from);
+  assert.ok(rendered.length > 0, "the meter must keep rendering while recording");
+  assert.deepEqual(rendered.filter((status) => /connecting/i.test(status ?? "")), []);
+});
+
 test("shutdown awaits an in-flight Deepgram abort before completing recorder disposal", async () => {
   const fake = fakeRecorder();
   let resolveReady!: () => void;
