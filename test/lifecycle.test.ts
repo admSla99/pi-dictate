@@ -106,7 +106,16 @@ async function harness(dependencies: Partial<DictateDependencies>, env: NodeJS.P
     registerShortcut: () => { shortcutRegistrations++; },
   };
 
-  const previousEnv = new Map(Object.keys(env).map((key) => [key, process.env[key]]));
+  // `dictate()` reads the ambient `process.env`, so a developer who exports
+  // PI_DICTATE_BACKEND=deepgram for real dictation would otherwise run every
+  // local-backend test against the Deepgram path. Clear the whole namespace,
+  // apply only what the test asked for, and restore afterwards.
+  const ownedKeys = new Set([
+    ...Object.keys(process.env).filter((key) => key.startsWith("PI_DICTATE_") || key.startsWith("DEEPGRAM_")),
+    ...Object.keys(env),
+  ]);
+  const previousEnv = new Map([...ownedKeys].map((key) => [key, process.env[key]]));
+  for (const key of ownedKeys) delete process.env[key];
   Object.assign(process.env, env);
   try {
     dictate(pi as any, dependencies);
@@ -586,6 +595,29 @@ test("Deepgram lifecycle connects before capturing, streams audio, finalizes, an
   assert.equal(fake.discardCount, 1);
   assert.equal(localCalls, 0);
   assert.equal(app.statuses.at(-1), undefined);
+});
+
+test("the connecting spinner stops once Deepgram capture starts", async (t) => {
+  const fake = fakeRecorder();
+  const dg = fakeDeepgramSession();
+  const app = await harness(
+    { createDeepgramSession: () => dg.session, recordAudio: async () => fake.recorder },
+    deepgramEnv,
+  );
+  t.after(() => app.shutdown());
+
+  const starting = app.toggle();
+  await tick();
+  dg.openReady();
+  await starting;
+
+  // Both the spinner (80 ms) and the meter (60 ms) write to the same status
+  // slot, so a leaked spinner shows up as alternating frames here.
+  const from = app.statuses.length;
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  const rendered = app.statuses.slice(from);
+  assert.ok(rendered.length > 0, "the meter must keep rendering while recording");
+  assert.deepEqual(rendered.filter((status) => /connecting/i.test(status ?? "")), []);
 });
 
 test("shutdown awaits an in-flight Deepgram abort before completing recorder disposal", async () => {

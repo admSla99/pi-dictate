@@ -724,6 +724,10 @@ export default function (pi: ExtensionAPI, dependencies: Partial<DictateDependen
     meterTimer = null;
   };
   const startMeter = () => {
+    // The meter owns the status slot once capture starts, so any spinner still
+    // running from a previous phase (e.g. "connecting to Deepgram") must be
+    // stopped — otherwise both intervals write to the same slot and it flickers.
+    stopSpinner();
     stopMeter();
     meter = new Array(METER_CELLS).fill(0);
     currentLevel = 0;
