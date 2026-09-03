@@ -106,7 +106,16 @@ async function harness(dependencies: Partial<DictateDependencies>, env: NodeJS.P
     registerShortcut: () => { shortcutRegistrations++; },
   };
 
-  const previousEnv = new Map(Object.keys(env).map((key) => [key, process.env[key]]));
+  // `dictate()` reads the ambient `process.env`, so a developer who exports
+  // PI_DICTATE_BACKEND=deepgram for real dictation would otherwise run every
+  // local-backend test against the Deepgram path. Clear the whole namespace,
+  // apply only what the test asked for, and restore afterwards.
+  const ownedKeys = new Set([
+    ...Object.keys(process.env).filter((key) => key.startsWith("PI_DICTATE_") || key.startsWith("DEEPGRAM_")),
+    ...Object.keys(env),
+  ]);
+  const previousEnv = new Map([...ownedKeys].map((key) => [key, process.env[key]]));
+  for (const key of ownedKeys) delete process.env[key];
   Object.assign(process.env, env);
   try {
     dictate(pi as any, dependencies);
